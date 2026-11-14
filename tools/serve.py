@@ -115,6 +115,39 @@ def make_cover(src_bytes, dst):
         os.replace(tmp, dst)
 
 
+BILI_ERRORS = {
+    -404: "视频不存在（BV 号写错了？或者稿件已被删除）",
+    -403: "没有权限访问这个视频（可能是私密或需要登录）",
+    -400: "请求参数不对，检查一下链接",
+    62002: "稿件不可见（可能已被删除或设为私密）",
+    62004: "稿件还在审核中，暂时拿不到音轨",
+}
+
+
+def bili_error(code, msg):
+    """把 B 站错误码翻成人话，别把 KeyError 那种东西扔给前端"""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = 0
+    if code in BILI_ERRORS:
+        return BILI_ERRORS[code]
+    if msg:
+        return "B 站返回错误：%s（code %s）" % (msg, code)
+    return "B 站接口返回异常（code %s）" % code
+
+
+def with_file_info(meta):
+    """补上音频文件的体积和格式，前端要用来显示"""
+    audio = str(meta.get("audio") or "")
+    try:
+        meta["size"] = os.path.getsize(os.path.join(ROOT, audio.lstrip("/")))
+    except OSError:
+        meta["size"] = 0
+    meta["format"] = "mp3" if audio.endswith(".mp3") else "m4a"
+    return meta
+
+
 def resolve(bvid):
     """下载并缓存一首 B 站音频，返回给前端的元信息"""
     folder = os.path.join(CACHE, bvid)
@@ -126,11 +159,17 @@ def resolve(bvid):
                     meta = json.load(f)
                 if os.path.exists(os.path.join(ROOT, meta["audio"].lstrip("/"))):
                     meta["cached"] = True
-                    return meta
+                    return with_file_info(meta)
             except Exception:
                 log("[warn] 缓存元信息损坏，重新抓取 " + bvid)
 
-        info = http_json("https://api.bilibili.com/x/web-interface/view?bvid=" + bvid)["data"]
+        resp = http_json("https://api.bilibili.com/x/web-interface/view?bvid=" + bvid)
+        if resp.get("code") != 0:
+            raise ValueError(bili_error(resp.get("code"), resp.get("message")))
+        info = resp.get("data") or {}
+        if not info.get("pages"):
+            raise ValueError("拿不到这个视频的分 P 信息，可能已下架")
+
         duration = info.get("duration") or 0
         if duration > MAX_DURATION:
             raise ValueError("视频太长（%d 秒），最多支持 %d 分钟" % (duration, MAX_DURATION // 60))
@@ -185,12 +224,13 @@ def resolve(bvid):
             "duration": duration,
             "audio": audio_rel,
             "cover": cover_rel,
+            "bitrate": best.get("bandwidth", 0),
             "cached": False,
         }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=1)
         log("[ok] 抓取完成 %s %s" % (bvid, meta["title"][:30]))
-        return meta
+        return with_file_info(meta)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):

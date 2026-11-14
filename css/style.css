@@ -152,6 +152,7 @@ kbd {
 }
 .ghost-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; border-color: var(--line-strong); }
 .ghost-btn.wide { width: 100%; justify-content: center; padding: 12px; }
+a.ghost-btn { text-decoration: none; cursor: pointer; }
 
 /* ---------------- 首页 Hero ---------------- */
 .hero {

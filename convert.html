@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>B站转 MP3 · SPECTRA</title>
+<meta name="description" content="粘贴 B 站视频链接，自动提取最高码率音轨并转成 MP3。">
+<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/convert.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 1.5 14.8 9.2 22.5 12 14.8 14.8 12 22.5 9.2 14.8 1.5 12 9.2 9.2Z' fill='%23a78bfa'/%3E%3C/svg%3E">
+</head>
+<body data-theme="sunset">
+
+<div class="bg-deco" aria-hidden="true">
+  <div class="glow g1"></div>
+  <div class="glow g2"></div>
+  <div class="grid"></div>
+</div>
+
+<div class="cv-wrap">
+
+  <header class="cv-top">
+    <a class="brand" href="./">
+      <span class="brand-mark">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+          <path d="M12 2 L14.6 9.4 L22 12 L14.6 14.6 L12 22 L9.4 14.6 L2 12 L9.4 9.4 Z" fill="currentColor"/>
+        </svg>
+      </span>
+      <span class="brand-text"><b>SPECTRA</b><i>音游锻造所</i></span>
+    </a>
+    <a class="cv-back" href="./">
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      返回音游
+    </a>
+  </header>
+
+  <main class="cv-main">
+
+    <div class="cv-head">
+      <span class="cv-kicker">TOOL · 音轨提取</span>
+      <h1>B 站视频 <span class="arrow">→</span> MP3</h1>
+      <p class="cv-lead">粘贴链接，自动抓最高码率音轨并转成 MP3。一次可以贴多行，逐个处理。</p>
+    </div>
+
+    <section class="cv-box">
+      <textarea id="cv-input" spellcheck="false" autocomplete="off"
+        placeholder="每行一个链接，例如：&#10;https://www.bilibili.com/video/BV1xCai6aE9g&#10;BV1k3S7BkEag&#10;https://b23.tv/xxxxxxx"></textarea>
+      <div class="cv-toolbar">
+        <button class="cv-go" id="cv-go">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          开始转换
+        </button>
+        <button class="cv-ghost" id="cv-paste">粘贴剪贴板</button>
+        <button class="cv-ghost" id="cv-clear">清空</button>
+        <span class="cv-hint" id="cv-hint">支持完整链接 / BV 号 / b23.tv 短链</span>
+      </div>
+    </section>
+
+    <div class="cv-bar" id="cv-bar" hidden>
+      <div class="cv-progress"><i id="cv-fill"></i></div>
+      <span class="cv-progress-text" id="cv-progress-text">0 / 0</span>
+    </div>
+
+    <div class="cv-bulk" id="cv-bulk" hidden>
+      <span id="cv-summary"></span>
+      <button class="cv-ghost" id="cv-all">全部下载</button>
+    </div>
+
+    <section class="cv-list" id="cv-list"></section>
+
+    <div class="cv-empty" id="cv-empty">
+      <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path d="M9 18V6l10-2v12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.5" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="16.5" cy="16" r="2.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+      <p>还没有任务。粘贴链接后点「开始转换」。</p>
+    </div>
+
+  </main>
+
+  <footer class="cv-foot">
+    <p>音轨缓存到本地 <code>assets/cache/&lt;BV号&gt;/</code>，同一首再来一次是秒出，不会重复下载。</p>
+    <p class="cv-warn">音频版权归原作者所有，请仅用于个人欣赏与学习，不要二次分发。</p>
+  </footer>
+
+</div>
+
+<script src="js/convert.js"></script>
+</body>
+</html>
