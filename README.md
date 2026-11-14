@@ -1,3 +1,5 @@
+# [link](https://xinyi-she.github.io/spectra/)
+
 # SPECTRA · 音游锻造所
 
 上传任意音频（MP3 / WAV / M4A / OGG / FLAC），浏览器里现场分析节拍、生成 EASY / NORMAL / HARD
