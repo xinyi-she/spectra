@@ -2,6 +2,7 @@ import { AudioEngine } from './audio.js';
 import { analyzeAudio } from './analyzer.js';
 import { generateAll, DIFFICULTIES } from './chart.js';
 import { RhythmGame } from './game.js';
+import { saveAudio, getAudio, deleteAudio, pruneAudio } from './store.js';
 
 /* ============================ 设置 ============================ */
 const DEFAULT_SETTINGS = {
@@ -192,7 +193,7 @@ function fmtTime(sec) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-async function loadAudioBuffer(arrayBuffer, song) {
+async function loadAudioBuffer(arrayBuffer, song, opts = {}) {
   $('analyze-overlay').classList.add('on');
   setAnalyze(6, '解码音频…', song.title);
   const bars = $('an-bars');
@@ -223,6 +224,24 @@ async function loadAudioBuffer(arrayBuffer, song) {
     song.levels = levels;
     SONG_META[song.key] = { bpm: result.analysis.bpm, levels };
     updateLibraryMeta(song.key, result.analysis.bpm, levels);
+
+    // 本地上传：把音频本体存进 IndexedDB，刷新/重开浏览器后曲库里还在
+    if (opts.file) {
+      try {
+        await saveAudio(song.key, opts.file, {
+          name: opts.file.name,
+          bpm: song.bpm,
+          levels,
+          title: song.title,
+        });
+        const ok = addUpload(song, opts.file.size, opts.file.name);
+        if (!ok) toast('曲库记录过多，这首歌下次可能找不到');
+        else toast('已存入曲库，下次直接点卡片就能玩');
+      } catch (e) {
+        console.error(e);
+        toast('浏览器没存下这首歌（空间可能不足），本次仍可正常玩');
+      }
+    }
     renderLibrary();
 
     setAnalyze(100, '完成', `BPM ${result.analysis.bpm} · 分析耗时 ${result.ms.analysis} ms`);
@@ -364,8 +383,67 @@ const LIBRARY_SEED = [
 ];
 const LIB_KEY = 'spectra.biliSongs';
 const REC_KEY = 'spectra.records';
+const UPLOAD_KEY = 'spectra.uploads';
+const MAX_UPLOADS = 20;
 
 const SONG_META = {}; // key -> { bpm, levels }，本次会话内缓存
+
+/* ---------------- 本地上传（元信息在 localStorage，音频在 IndexedDB） ---------------- */
+function getUploads() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(UPLOAD_KEY) || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeUploads(list) {
+  try {
+    localStorage.setItem(UPLOAD_KEY, JSON.stringify(list.slice(0, MAX_UPLOADS)));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function addUpload(song, size, fileName) {
+  const list = getUploads().filter((s) => s.key !== song.key);
+  list.unshift({
+    key: song.key,
+    title: song.title,
+    artist: song.artist,
+    cover: song.cover,
+    size,
+    name: fileName || '',
+    bpm: song.bpm,
+    levels: song.levels,
+    at: Date.now(),
+  });
+  // 超出上限时把最老的挤出去，顺手回收它的音频
+  const overflow = list.splice(MAX_UPLOADS);
+  for (const o of overflow) deleteAudio(o.key).catch(() => {});
+  return writeUploads(list);
+}
+
+function removeUpload(key) {
+  writeUploads(getUploads().filter((s) => s.key !== key));
+}
+
+/** 上传记录 → 曲库条目 */
+function uploadToSong(u) {
+  return {
+    key: u.key,
+    title: u.title,
+    artist: u.artist,
+    cover: u.cover,
+    source: '本地上传',
+    kind: 'upload',
+    bpm: u.bpm,
+    levels: u.levels,
+    size: u.size,
+  };
+}
 
 const rankClass = (rank) => {
   if (rank === 'SSS' || rank === 'SS' || rank === 'S') return 'rk-top';
@@ -384,8 +462,9 @@ function getLibrary() {
   } catch {
     extra = [];
   }
+  const uploads = getUploads().map(uploadToSong);
   const seen = new Set();
-  return [...LIBRARY_SEED, ...extra]
+  return [...uploads, ...LIBRARY_SEED, ...extra]
     .filter((s) => {
       if (seen.has(s.key)) return false;
       seen.add(s.key);
@@ -410,9 +489,19 @@ function setAudioOverride(key, audio, cover) {
   }
 }
 
+/** 只读写 LIB_KEY 里的原始列表，别把 uploads / 内置曲混进去 */
+function readExtra() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(LIB_KEY) || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
 function addToLibrary(song) {
   if (LIBRARY_SEED.some((s) => s.key === song.key)) return;
-  const extra = getLibrary().filter((s) => !s.builtin && s.key !== song.key);
+  const extra = readExtra().filter((s) => s.key !== song.key);
   extra.unshift({
     key: song.key,
     title: song.title,
@@ -444,7 +533,12 @@ function updateLibraryMeta(key, bpm, levels) {
 }
 
 function removeFromLibrary(key) {
-  const extra = getLibrary().filter((s) => !s.builtin && s.key !== key);
+  const song = getLibrary().find((s) => s.key === key);
+  if (song && song.kind === 'upload') {
+    removeUpload(key);
+    deleteAudio(key).catch(() => {});
+  }
+  const extra = readExtra().filter((s) => s.key !== key);
   localStorage.setItem(LIB_KEY, JSON.stringify(extra));
 }
 
@@ -490,6 +584,26 @@ async function loadSong(song) {
     restoreCache();
     return;
   }
+
+  // 本地上传的歌：音频在 IndexedDB 里
+  if (song.kind === 'upload') {
+    try {
+      $('analyze-overlay').classList.add('on');
+      setAnalyze(4, '从浏览器里读取音频…', song.title);
+      const rec = await getAudio(song.key);
+      if (!rec || !rec.blob) throw new Error('missing');
+      const buf = await rec.blob.arrayBuffer();
+      await loadAudioBuffer(buf, song);
+    } catch (err) {
+      console.error(err);
+      $('analyze-overlay').classList.remove('on');
+      toast('这首歌的音频已不在浏览器里（可能清理过站点数据），请重新上传一次');
+      state.view = 'home';
+      showScreen('home');
+    }
+    return;
+  }
+
   try {
     $('analyze-overlay').classList.add('on');
     setAnalyze(3, '读取音频…', song.title);
@@ -534,9 +648,11 @@ async function loadFile(file) {
   const song = {
     key: 'file-' + file.name + '-' + file.size,
     title: title || '未命名音频',
-    artist: '本地文件 · ' + (file.size / 1048576).toFixed(1) + ' MB',
+    artist: '本地上传 · ' + (file.size / 1048576).toFixed(1) + ' MB',
     cover: placeholderCover(title),
     source: '本地上传',
+    kind: 'upload',
+    size: file.size,
   };
   state.song = song;
   if (state.cache && state.cache.key === song.key) {
@@ -547,7 +663,7 @@ async function loadFile(file) {
   setAnalyze(4, '读取文件…', file.name);
   await nextFrame();
   const buf = await file.arrayBuffer();
-  await loadAudioBuffer(buf, song);
+  await loadAudioBuffer(buf, song, { file });
 }
 
 /* ============================ B 站链接解析 ============================ */
@@ -604,6 +720,7 @@ async function pruneLibrary() {
   const lib = getLibrary();
   const flags = await Promise.all(
     lib.map(async (s) => {
+      if (s.kind === 'upload') return true; // 音频在 IndexedDB，不在站点里
       try {
         const r = await fetch(s.audio, { method: 'HEAD' });
         return r.ok;
@@ -713,13 +830,14 @@ function renderLibrary() {
       const meta = [];
       if (info.bpm) meta.push('BPM ' + info.bpm);
       if (info.levels) meta.push('Lv ' + info.levels.join(' / '));
-      if (!info.bpm) meta.push(s.builtin ? '内置' : 'B站');
+      if (!info.bpm) meta.push(s.builtin ? '内置' : s.kind === 'upload' ? '本地上传' : 'B站');
       const rank = best
         ? '<span class="st-rank ' + rankClass(best.rank) + '">' + DIFF_SHORT[best.id] + ' ' + best.rank + '</span>'
         : '';
+      // 注意：外层是 <button>，这里不能再套 <button>（HTML 不允许），否则解析器会截断整张卡片
       const del = s.builtin
         ? ''
-        : '<button class="st-del" data-del="' + s.key + '" title="从曲库移除">✕</button>';
+        : '<span class="st-del" data-del="' + s.key + '" role="button" title="从曲库移除">✕</span>';
       return (
         '<button class="song-tile" data-key="' + s.key + '">' +
         '<div class="st-cover">' +

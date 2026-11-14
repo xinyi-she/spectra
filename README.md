@@ -43,7 +43,8 @@ python --version    # 没有版本号输出 = 没装真正的 Python
 ## 三种进歌方式
 
 1. **曲库**：首页直接点卡片（内置两首 B 站投稿转出的音频）
-2. **本地上传**：拖入 / 选择 MP3、WAV、M4A、OGG、FLAC
+2. **本地上传**：拖入 / 选择 MP3、WAV、M4A、OGG、FLAC。分析完会存进浏览器（IndexedDB），
+   曲库里留一张卡 —— 刷新页面、关掉浏览器重开都还在，最多保留 20 首
 3. **B 站链接**：粘贴 `https://www.bilibili.com/video/BV…`、`BV 号` 或 `b23.tv` 短链，
    本地服务会解析、下载音轨（192kbps）并缓存到 `assets/cache/<BV号>/`，之后秒开
 

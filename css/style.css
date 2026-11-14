@@ -561,8 +561,11 @@ a.ghost-btn { text-decoration: none; cursor: pointer; }
   background: rgba(0, 0, 0, 0.5);
   color: var(--muted);
   font-size: 10px;
+  line-height: 1;
   display: none;
   place-items: center;
+  cursor: pointer;
+  user-select: none;
 }
 .song-tile:hover .st-del { display: grid; }
 .st-del:hover { color: #fff; background: rgba(251, 113, 133, 0.6); }
