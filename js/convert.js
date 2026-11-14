@@ -94,6 +94,14 @@ function saveHistory() {
 }
 
 /* ---------------- 服务检测 ---------------- */
+function setHintHTML(html, cls) {
+  els.hint.innerHTML = html;
+  els.hint.classList.remove('err', 'ok');
+  if (cls) els.hint.classList.add(cls);
+}
+
+const isLocalHost = /^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)$/.test(location.hostname);
+
 async function checkApi() {
   let ok = false;
   try {
@@ -104,8 +112,23 @@ async function checkApi() {
   }
   apiOK = ok;
   if (!ok) {
-    setHint('本地服务未连接：请在 beatforge 目录运行 python tools/serve.py 8777', 'err');
     els.go.disabled = true;
+    if (isLocalHost) {
+      // 本地但连不上：服务没起来
+      setHintHTML(
+        '本地服务没启动：双击 <b>启动.bat</b>，或在这个目录运行 <code>python tools/serve.py 8777</code>',
+        'err'
+      );
+    } else {
+      // 打开了线上版本：B 站解析不可能在这里工作
+      setHintHTML(
+        '你现在打开的是线上版本（' +
+          esc(location.hostname) +
+          '），B 站解析必须在本地跑。' +
+          '<a href="http://127.0.0.1:8777/convert.html">点我打开本地页面 →</a>',
+        'err'
+      );
+    }
   }
   return ok;
 }

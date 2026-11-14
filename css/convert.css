@@ -158,6 +158,19 @@
   color: var(--dim);
 }
 .cv-hint.err { color: var(--t-miss); }
+.cv-hint a {
+  color: var(--a1);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.cv-hint code {
+  font-family: var(--display);
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
 .cv-hint.ok { color: #4ade80; }
 
 /* hidden 属性对 display:flex 的元素不生效，需要显式覆盖 */
@@ -384,7 +397,7 @@
 /* ---------------- 窄屏 ---------------- */
 @media (max-width: 640px) {
   .cv-wrap { width: calc(100% - 28px); }
-  .cv-hint { display: none; }
+  .cv-hint { width: 100%; margin-left: 0; margin-top: 2px; line-height: 1.7; }
   .cv-item { flex-wrap: wrap; }
   .cv-cover { width: 60px; height: 38px; }
   .cv-info { flex: 1 1 calc(100% - 74px); }

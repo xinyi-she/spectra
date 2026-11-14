@@ -43,10 +43,20 @@ echo.
 set "CODE=%ERRORLEVEL%"
 
 echo.
-if "%CODE%"=="0" (
-  echo 服务已停止。按任意键关闭窗口。
+if "%CODE%"=="2" (
+  echo   [OK] 服务本来就在运行，浏览器已经打开了。
+  echo   这个窗口可以直接关掉，不影响使用。
+  echo.
+  echo   注意：浏览器地址栏必须是 http://127.0.0.1:8777/
+  echo   如果显示的是 *.github.io 那种地址，B 站解析是不工作的。
+  echo   B 站转 MP3 页面：http://127.0.0.1:8777/convert.html
 ) else (
-  echo 服务异常退出（代码 %CODE%），日志在 tools\server.log。按任意键关闭。
+  if "%CODE%"=="0" (
+    echo   服务已停止。按任意键关闭窗口。
+  ) else (
+    echo   [错误] 服务退出，代码 %CODE%。日志在 tools\server.log
+    echo   按任意键关闭窗口。
+  )
 )
 pause >nul
 exit /b 0

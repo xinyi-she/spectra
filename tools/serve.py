@@ -328,10 +328,11 @@ def main():
 
     # 先看端口上是不是已经有本服务在跑（Windows 的 bind 行为不可靠，不能只靠它报错）
     if port_in_use_by_us(port):
-        log("服务已在运行，直接复用：%s" % url)
+        log("服务已经在运行了，直接用这个：%s" % url)
         if auto_open:
             webbrowser.open(url)
-        return
+        # 退出码 2 = 复用了已有实例（不是出错，启动脚本据此给不同提示）
+        sys.exit(2)
 
     try:
         httpd = Server(("127.0.0.1", port), Handler)
