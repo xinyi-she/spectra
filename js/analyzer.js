@@ -1,0 +1,322 @@
+import { FFT, hann } from './fft.js';
+
+/**
+ * 音频分析引擎
+ * ------------------------------------------------------------------
+ * 1. 单声道混合 + 短时傅里叶变换（STFT）
+ * 2. 五个频段的「谱通量」→ 击打强度曲线（onset strength）
+ * 3. 自适应阈值峰值拾取 → 音符候选点（带频段特征）
+ * 4. 自相关 + 谐波梳状评分 → BPM / 拍点相位
+ * 5. 能量包络 → 段落强度（用于谱面情绪起伏）
+ */
+
+const BANDS = [
+  { name: 'bass', lo: 25, hi: 140 },
+  { name: 'low', lo: 140, hi: 450 },
+  { name: 'mid', lo: 450, hi: 1400 },
+  { name: 'high', lo: 1400, hi: 4500 },
+  { name: 'air', lo: 4500, hi: 14000 },
+];
+
+const BAND_WEIGHT = [1.0, 1.45, 1.2, 1.0, 0.5];
+
+function percentile(arr, p) {
+  const a = Float32Array.from(arr);
+  a.sort();
+  const idx = Math.min(a.length - 1, Math.max(0, Math.round((a.length - 1) * p)));
+  return a[idx];
+}
+
+/**
+ * @param {Float32Array[]|Float32Array} channelData
+ * @param {number} sampleRate
+ * @param {(p:number, label:string)=>void} [onProgress]
+ */
+export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
+  const isArray = Array.isArray(channelData);
+  const channels = isArray ? channelData : [channelData];
+  const total = channels[0].length;
+
+  // ---- 1. 单声道 ----
+  onProgress(0.05, '混合声道');
+  let mono;
+  if (channels.length === 1) {
+    mono = channels[0];
+  } else {
+    mono = new Float32Array(total);
+    const inv = 1 / channels.length;
+    for (let c = 0; c < channels.length; c++) {
+      const ch = channels[c];
+      for (let i = 0; i < total; i++) mono[i] += ch[i] * inv;
+    }
+  }
+
+  // ---- 2. STFT ----
+  let frameLen = 1024;
+  while (frameLen < sampleRate * 0.032) frameLen <<= 1;
+  const hop = Math.max(128, Math.round(sampleRate * 0.0232));
+  const frameDur = hop / sampleRate;
+  const frames = Math.max(1, Math.floor((total - frameLen) / hop));
+  const bins = frameLen >> 1;
+  const binHz = sampleRate / frameLen;
+
+  // 频段 → bin 区间
+  const bandBins = BANDS.map((b) => ({
+    lo: Math.max(1, Math.floor(b.lo / binHz)),
+    hi: Math.min(bins - 1, Math.ceil(b.hi / binHz)),
+    name: b.name,
+  }));
+
+  onProgress(0.12, '计算频谱');
+  const fft = new FFT(frameLen);
+  const win = hann(frameLen);
+  const spec = new Float32Array(bins);
+  const prev = new Float32Array(bins);
+
+  // 每频段通量 + 能量
+  const flux = BANDS.map(() => new Float32Array(frames));
+  const energy = BANDS.map(() => new Float32Array(frames));
+
+  for (let f = 0; f < frames; f++) {
+    fft.magnitude(mono, f * hop, win, spec);
+    for (let b = 0; b < BANDS.length; b++) {
+      const { lo, hi } = bandBins[b];
+      let fl = 0;
+      let en = 0;
+      for (let i = lo; i <= hi; i++) {
+        const v = Math.log1p(spec[i] * 4);
+        const d = v - prev[i];
+        if (d > 0) fl += d;
+        en += v;
+        prev[i] = v;
+      }
+      flux[b][f] = fl / (hi - lo + 1);
+      energy[b][f] = en / (hi - lo + 1);
+    }
+    if ((f & 255) === 0) onProgress(0.12 + 0.5 * (f / frames), '计算频谱');
+  }
+
+  // 频段内归一化（避免低频独占）
+  for (let b = 0; b < BANDS.length; b++) {
+    const scale = percentile(flux[b], 0.97) || 1;
+    for (let f = 0; f < frames; f++) flux[b][f] /= scale;
+  }
+
+  // ---- 3. onset 强度曲线 ----
+  let os = new Float32Array(frames);
+  for (let f = 0; f < frames; f++) {
+    let v = 0;
+    for (let b = 0; b < BANDS.length; b++) v += flux[b][f] * BAND_WEIGHT[b];
+    os[f] = v;
+  }
+  // 3 点平滑 + 按 p98 归一化
+  const sm = new Float32Array(frames);
+  for (let f = 0; f < frames; f++) {
+    const a = os[Math.max(0, f - 1)];
+    const b = os[f];
+    const c = os[Math.min(frames - 1, f + 1)];
+    sm[f] = a * 0.25 + b * 0.5 + c * 0.25;
+  }
+  const osScale = percentile(sm, 0.98) || 1;
+  for (let f = 0; f < frames; f++) sm[f] = Math.min(1.6, sm[f] / osScale);
+  os = sm;
+
+  // ---- 4. 峰值拾取 ----
+  onProgress(0.68, '提取击打点');
+  const w = Math.round(0.5 / frameDur);
+  const prefix = new Float64Array(frames + 1);
+  for (let f = 0; f < frames; f++) prefix[f + 1] = prefix[f] + os[f];
+
+  const peakFrames = [];
+  const offsetSec = frameLen / 2 / sampleRate;
+  for (let f = 2; f < frames - 2; f++) {
+    const a = Math.max(0, f - w);
+    const b = Math.min(frames, f + w + 1);
+    const mean = (prefix[b] - prefix[a]) / (b - a);
+    const thr = mean * 1.18 + 0.012;
+    const v = os[f];
+    if (v < thr) continue;
+    if (v < os[f - 1] || v < os[f + 1]) continue;
+    if (v < os[f - 2] || v < os[f + 2]) continue;
+    peakFrames.push(f);
+  }
+  // 合并过近的峰
+  const minGapFrames = Math.max(2, Math.round(0.055 / frameDur));
+  const onsets = [];
+  for (const f of peakFrames) {
+    const last = onsets[onsets.length - 1];
+    if (last && f - last.f < minGapFrames) {
+      if (os[f] > last.s) {
+        last.f = f;
+        last.s = os[f];
+        last.t = f * frameDur + offsetSec;
+      }
+    } else {
+      onsets.push({ f, s: os[f], t: f * frameDur + offsetSec });
+    }
+  }
+  // 频段特征
+  for (const o of onsets) {
+    const bands = [];
+    for (let b = 0; b < BANDS.length; b++) bands.push(flux[b][o.f] || 0);
+    o.bands = bands;
+    o.tone = bands[4] > bands[0] * 1.15 ? 'hat' : bands[2] + bands[3] > bands[0] * 1.1 ? 'snare' : 'kick';
+  }
+
+  // ---- 5. BPM ----
+  onProgress(0.8, '估算 BPM');
+  const lagMin = Math.max(2, Math.round(0.28 / frameDur));
+  const lagMax = Math.min(frames >> 1, Math.round(1.35 / frameDur));
+  const ac = new Float64Array(lagMax + 2);
+  for (let lag = lagMin; lag <= lagMax; lag++) {
+    let sum = 0;
+    const n = frames - lag;
+    for (let i = 0; i < n; i++) sum += os[i] * os[i + lag];
+    ac[lag] = sum / Math.max(1, n);
+  }
+  const acAt = (lag) => {
+    const L = Math.max(1, Math.min(lagMax, lag));
+    const i0 = Math.floor(L);
+    const fr = L - i0;
+    const a = ac[i0] || 0;
+    const b = ac[Math.min(lagMax, i0 + 1)] || 0;
+    return a * (1 - fr) + b * fr;
+  };
+
+  let bestBpm = 120;
+  let bestScore = -1;
+  for (let bpm = 58; bpm <= 205; bpm += 0.25) {
+    const L = 60 / bpm / frameDur;
+    const comb = acAt(L) + 0.55 * acAt(L * 2) + 0.32 * acAt(L * 3) + 0.18 * acAt(L * 4);
+    // 轻微偏好 90–165 的常见区间
+    const prior = Math.exp(-Math.pow(Math.log2(bpm / 125) / 0.62, 2) * 0.5);
+    const score = comb * (0.75 + 0.25 * prior);
+    if (score > bestScore) {
+      bestScore = score;
+      bestBpm = bpm;
+    }
+  }
+  // 折叠到 75–180 区间
+  while (bestBpm < 75) bestBpm *= 2;
+  while (bestBpm > 180) bestBpm /= 2;
+
+  // ---- 5.5 相位相干精修 BPM（关键：整首歌不能漂拍）----
+  const coherence = (bpm) => {
+    const w = (2 * Math.PI) / (60 / bpm);
+    let re = 0;
+    let im = 0;
+    let sum = 0;
+    for (const o of onsets) {
+      const wt = o.s * o.s;
+      re += wt * Math.cos(w * o.t);
+      im += wt * Math.sin(w * o.t);
+      sum += wt;
+    }
+    if (!sum) return { c: 0, ph: 0 };
+    return { c: Math.hypot(re, im) / sum, ph: Math.atan2(im, re) };
+  };
+
+  let refined = bestBpm;
+  let bestC = -1;
+  let bestPh = 0;
+  for (let cand = bestBpm * 0.955; cand <= bestBpm * 1.045; cand += 0.02) {
+    const r = coherence(cand);
+    if (r.c > bestC) {
+      bestC = r.c;
+      refined = cand;
+      bestPh = r.ph;
+    }
+  }
+  // 大多数曲子是整数 BPM，靠近整数就吸附
+  if (Math.abs(refined - Math.round(refined)) < 0.14) refined = Math.round(refined);
+  if (Math.abs(refined * 2 - Math.round(refined * 2)) < 0.1) refined = Math.round(refined * 2) / 2;
+
+  let bpm = Math.round(refined * 10) / 10;
+  let beatDur = 60 / bpm;
+
+  // ---- 6. 拍点相位：以相干相位为起点，全拍搜索最优 ----
+  const ph0 = (bestPh / ((2 * Math.PI) / beatDur) + beatDur * 4) % beatDur;
+  const scorePhase = (p) => {
+    let s = 0;
+    for (let k = 0; ; k++) {
+      const idx = Math.round((p + k * beatDur) / frameDur);
+      if (idx >= frames) break;
+      s += os[idx];
+    }
+    return s;
+  };
+  let firstBeat = ph0;
+  let bestS = -1;
+  for (let p = 0; p < beatDur - 1e-6; p += 0.005) {
+    const s = scorePhase(p);
+    if (s > bestS) {
+      bestS = s;
+      firstBeat = p;
+    }
+  }
+
+  // ---- 6.5 最小二乘拟合拍网格：消除残余 BPM 误差造成的整曲漂移 ----
+  for (let iter = 0; iter < 4; iter++) {
+    let cnt = 0;
+    let sk = 0;
+    let st = 0;
+    let skk = 0;
+    let skt = 0;
+    for (const o of onsets) {
+      const k = Math.round((o.t - firstBeat) / beatDur);
+      const resid = o.t - (firstBeat + k * beatDur);
+      if (Math.abs(resid) > beatDur * 0.16) continue;
+      cnt++;
+      sk += k;
+      st += o.t;
+      skk += k * k;
+      skt += k * o.t;
+    }
+    const denom = cnt * skk - sk * sk;
+    if (cnt < 12 || Math.abs(denom) < 1e-9) break;
+    const b = (cnt * skt - sk * st) / denom;
+    const a = (st - b * sk) / cnt;
+    if (!isFinite(b) || b <= 0 || Math.abs(b - beatDur) > beatDur * 0.03) break;
+    beatDur = b;
+    firstBeat = a;
+  }
+  firstBeat = ((firstBeat % beatDur) + beatDur) % beatDur;
+  bpm = Math.round((60 / beatDur) * 100) / 100;
+
+  // ---- 7. 段落能量 ----
+  const rms = new Float32Array(frames);
+  for (let f = 0; f < frames; f++) {
+    let v = 0;
+    for (let b = 0; b < BANDS.length; b++) v += energy[b][f] * (b === 0 ? 0.2 : 1);
+    rms[f] = v;
+  }
+  const rmsMax = percentile(rms, 0.95) || 1;
+  for (let f = 0; f < frames; f++) rms[f] = Math.min(1.5, rms[f] / rmsMax);
+
+  onProgress(0.9, '整理节拍');
+
+  return {
+    duration: total / sampleRate,
+    sampleRate,
+    frameDur,
+    frames,
+    bpm,
+    beatDur,
+    firstBeat,
+    onsetStrength: os,
+    rms,
+    energy: { bass: energy[0], low: energy[1], mid: energy[2], high: energy[3], air: energy[4] },
+    onsets,
+    stats: {
+      onsetCount: onsets.length,
+      bpm,
+    },
+    energyAt(t) {
+      const f = Math.round(t / frameDur);
+      return rms[Math.max(0, Math.min(frames - 1, f))];
+    },
+    beatAt(t) {
+      return (t - firstBeat) / beatDur;
+    },
+  };
+}

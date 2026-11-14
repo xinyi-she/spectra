@@ -1,0 +1,24 @@
+# ---- 依赖 / 运行产物 ----
+node_modules/
+assets/cache/
+tools/edge/
+tools/*.raw
+tools/server.log
+tools/bv*.json
+tools/playurl.json
+tools/shot-*.png
+
+# ---- 版权内容：B 站投稿的音轨与封面，不要公开分发 ----
+assets/demo/*.mp3
+assets/demo/*.m4a
+assets/demo/*.jpg
+assets/demo/*-meta.json
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 仓库内附带的无版权示例曲（CC0，可随代码分发）
+!assets/demo/spectra-demo.mp3
+!assets/demo/spectra-demo.jpg

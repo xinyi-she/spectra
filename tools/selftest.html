@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>SELFTEST</title>
+<style>body{background:#111;color:#eee;font:13px/1.6 monospace;padding:16px}pre{white-space:pre-wrap}</style>
+</head>
+<body>
+<pre id="out">booting…</pre>
+<script type="module">
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += '\n' + s; };
+const errors = [];
+window.addEventListener('error', (e) => errors.push('ERROR: ' + e.message + ' @' + e.filename + ':' + e.lineno));
+window.addEventListener('unhandledrejection', (e) => errors.push('REJECT: ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason)));
+
+try {
+  log('import modules…');
+  const { AudioEngine } = await import('../js/audio.js');
+  const { analyzeAudio } = await import('../js/analyzer.js');
+  const { generateAll } = await import('../js/chart.js');
+  log('modules ok');
+
+  const audio = new AudioEngine();
+  await audio.init().catch((e) => log('init err ' + e.message));
+  log('ctx state=' + (audio.ctx && audio.ctx.state) + ' sr=' + (audio.ctx && audio.ctx.sampleRate) + ' latency=' + audio.latency);
+
+  const t0 = performance.now();
+  const res = await fetch('../assets/demo/tenfold.mp3');
+  const buf = await res.arrayBuffer();
+  log('fetched ' + buf.byteLength + ' bytes in ' + Math.round(performance.now() - t0) + 'ms');
+
+  const t1 = performance.now();
+  const decoded = await audio.decode(buf);
+  log('decoded ' + decoded.duration.toFixed(2) + 's ch=' + decoded.numberOfChannels + ' in ' + Math.round(performance.now() - t1) + 'ms');
+
+  const t2 = performance.now();
+  const chans = [];
+  for (let c = 0; c < Math.min(2, decoded.numberOfChannels); c++) chans.push(decoded.getChannelData(c));
+  const a = analyzeAudio(chans, decoded.sampleRate, () => {});
+  log('analyzed in ' + Math.round(performance.now() - t2) + 'ms  BPM=' + a.bpm + ' onsets=' + a.onsets.length + ' firstBeat=' + a.firstBeat.toFixed(3));
+
+  const t3 = performance.now();
+  const charts = generateAll(a);
+  log('charts in ' + Math.round(performance.now() - t3) + 'ms');
+  for (const c of charts) {
+    log(`  ${c.name} Lv.${c.level} notes=${c.noteCount} nps=${c.nps} holds=${c.notes.filter(n=>n.type==='hold').length} special=${c.notes.filter(n=>n.type==='special').length}`);
+  }
+  log('DONE');
+} catch (e) {
+  log('FATAL ' + (e.stack || e));
+}
+log('--- errors: ' + (errors.length ? '\n' + errors.join('\n') : 'none'));
+</script>
+</body>
+</html>
