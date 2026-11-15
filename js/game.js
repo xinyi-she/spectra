@@ -125,15 +125,29 @@ export class RhythmGame {
     this.running = true;
     this.paused = false;
     this.finished = false;
-    const from = fromSec != null ? fromSec : Math.max(0, this.firstNote - 3.0);
+    // 开场缓冲：至少有 LEAD_IN 秒让玩家看清键位、听完 3-2-1。
+    // 之前是 `Math.max(0, firstNote - 3.0)`，凡是第一颗音在 3 秒内的曲子
+    // 都会被压成 0 —— 一开播就直接开打，完全没有准备时间。
+    const LEAD_IN = 3.4;
+    let from;
+    let delay = 0;
+    if (fromSec != null) {
+      from = Math.max(0, fromSec);
+    } else if (this.firstNote >= LEAD_IN) {
+      from = this.firstNote - LEAD_IN;
+    } else {
+      // 曲子一上来就有音：先静音等 LEAD_IN 秒（谱面时间从负数开始走）
+      from = 0;
+      delay = LEAD_IN - this.firstNote;
+    }
     // 从中途开始时不把开头音符算作 MISS
     this.missCursor = 0;
     while (this.missCursor < this.notes.length && this.notes[this.missCursor].t < from) this.missCursor++;
     if (this.clockMode === 'perf') {
       this.perfT0 = performance.now();
-      this.perfStart = from;
+      this.perfStart = from - delay;
     } else {
-      this.audio.play(from);
+      this.audio.play(from, delay);
     }
     this.lastTs = performance.now();
     cancelAnimationFrame(this.raf);
@@ -242,10 +256,10 @@ export class RhythmGame {
       if (this.judgeText.life <= 0) this.judgeText = null;
     }
 
-    // 倒计时
+    // 倒计时（最多数到 3，别因为缓冲长一点就冒出个"4"）
     const remain = this.firstNote - now;
     if (remain > 0.35 && remain <= 3.4) {
-      const v = Math.ceil(remain);
+      const v = Math.min(3, Math.ceil(remain));
       if (v !== this.countdownValue) {
         this.countdownValue = v;
         this.showCountdown(String(v));

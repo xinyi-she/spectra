@@ -931,9 +931,14 @@ export function generateChart(analysis, diff, options = {}) {
   const barOf = (t) => Math.floor((t - firstBeat) / barDur);
 
   // ---- 1. 事件吸附到拍网格（同一格只留最强的一个）----
+  // 开场缓冲：谱面第一颗音至少落在 LEAD_IN 秒之后，而且压在**小节线**上。
+  // 之前只挡了 0.8 秒 —— 一上来就有音的曲子会"一开播就开打"，完全没有准备时间。
+  const LEAD_IN = 3.4;
+  const leadBars = Math.max(1, Math.ceil((LEAD_IN - firstBeat) / barDur));
+  const firstAllowed = firstBeat + leadBars * barDur;
   const bySlot = new Map();
   for (const e of clusterOnsets(analysis.onsets)) {
-    if (e.t <= 0.8 || e.t >= duration - 0.85) continue;
+    if (e.t < firstAllowed || e.t >= duration - 0.85) continue;
     const slot = slotOf(e.t);
     const t = timeOf(slot);
     if (Math.abs(t - e.t) > step * 0.55) continue;

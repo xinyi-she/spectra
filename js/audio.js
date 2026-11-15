@@ -50,7 +50,13 @@ export class AudioEngine {
     if (this.sfxGain) this.sfxGain.gain.value = v * 0.5;
   }
 
-  play(from = 0) {
+  /**
+   * 播放。
+   * @param {number} from  从音频的第几秒开始
+   * @param {number} delay 延迟多少秒再出声。开场 lead-in 用：先让玩家看谱 + 倒计时，
+   *                       音乐后进；这期间 position 会是负数，正好对应"演出时间 0 之前"。
+   */
+  play(from = 0, delay = 0) {
     if (!this.buffer) return;
     if (this.ctx.state === 'suspended') this.ctx.resume();
     this.stopSource();
@@ -58,9 +64,10 @@ export class AudioEngine {
     src.buffer = this.buffer;
     src.connect(this.master);
     const at = Math.max(0, Math.min(from, this.buffer.duration - 0.05));
-    src.start(0, at);
+    const when = this.ctx.currentTime + Math.max(0, delay);
+    src.start(when, at);
     this.source = src;
-    this.startCtxTime = this.ctx.currentTime;
+    this.startCtxTime = when;
     this.offset = at;
     this.playing = true;
     src.onended = () => {
@@ -83,7 +90,7 @@ export class AudioEngine {
   }
 
   pause() {
-    this.offset = this.position;
+    this.offset = Math.max(0, this.position);
     this.playing = false;
     this.stopSource();
   }
@@ -96,8 +103,9 @@ export class AudioEngine {
 
   get position() {
     if (!this.ctx || !this.buffer) return 0;
-    let t = this.playing ? this.offset + (this.ctx.currentTime - this.startCtxTime - this.latency) : this.offset;
-    return Math.max(0, Math.min(this.buffer.duration, t));
+    const t = this.playing ? this.offset + (this.ctx.currentTime - this.startCtxTime - this.latency) : this.offset;
+    // 不截断下界：delay 期间是负数，代表"开场前"，游戏时间要靠它对齐
+    return Math.min(this.buffer.duration, t);
   }
 
   get duration() {
