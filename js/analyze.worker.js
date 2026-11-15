@@ -9,10 +9,13 @@ self.onmessage = (e) => {
     const t1 = performance.now();
     const charts = generateAll(analysis);
     const t2 = performance.now();
-    // 方法无法结构化克隆，去掉后再发回主线程
-    const { energyAt, beatAt, ...plain } = analysis;
+    // 方法无法结构化克隆，去掉后再发回主线程。
+    // 注意：必须把分析结果里的**所有函数**都列出来。漏一个就会 DataCloneError，
+    // 整个结果发不回去 —— 表现为"分析 8ms、0 个音符、BPM 也不对"。
+    const { energyAt, beatAt, pitchRel, ...plain } = analysis;
     void energyAt;
     void beatAt;
+    void pitchRel;
     self.postMessage({
       ok: true,
       analysis: plain,

@@ -40,6 +40,8 @@ export const DIFFICULTIES = [
     jump: 0.5,       // 大跳（跨 3 个键）降权，EASY 尽量走相邻
     handBias: 1.35,
     anchor: 0.18,
+    // 音高完全相同的重复音 → 允许真 jack 的概率。低难度尽量不出现。
+    pitchJackChance: 0.1,
   },
   {
     id: 'normal',
@@ -66,6 +68,7 @@ export const DIFFICULTIES = [
     jump: 0.65,
     handBias: 1.45,
     anchor: 0.22,
+    pitchJackChance: 0.45,
   },
   {
     id: 'hard',
@@ -92,10 +95,18 @@ export const DIFFICULTIES = [
     jump: 0.55,
     handBias: 1.5,
     anchor: 0.26,
+    pitchJackChance: 0.9,
   },
 ];
 
 const LANE_KEYS = [0, 1, 2, 3];
+
+/**
+ * 音高可信度门槛：低于这个值的 onset 当作"没有明确音高"（鼓、噪声、齿音），
+ * 交给常规加权选择，不参与旋律走向。0.6 是实测的分界点 ——
+ * 再低会把军鼓的余响当成旋律，再高则漏掉太多人声。
+ */
+const PITCH_USE_CLARITY = 0.6;
 
 /** 双押组合的舒适度权重：外外 > 外内 > 内内（1-2 食指内收最别扭） */
 const CHORD_COMFORT = {
@@ -111,7 +122,7 @@ function chordKey(a, b) {
   return a < b ? a + '-' + b : b + '-' + a;
 }
 
-/** 把距离很近的击打点并成一个音符事件 */
+/** 把距离很近的击打点并成一个音符事件（音高取其中可信度最高的那个） */
 function clusterOnsets(onsets, maxGap = 0.048) {
   const out = [];
   for (const o of onsets) {
@@ -121,8 +132,25 @@ function clusterOnsets(onsets, maxGap = 0.048) {
       last.t = (last.t * last.s + o.t * o.s) / (w || 1);
       last.s = Math.max(last.s, o.s);
       if (o.s > last.s * 0.9) last.tone = o.tone;
+      // 音高单独判：以"可信度"为准，而不是响度 ——
+      // 一个安静的钢琴音比一记响亮的军鼓更值得当旋律
+      if ((o.clarity || 0) > (last.clarity || 0)) {
+        last.semi = o.semi;
+        last.clarity = o.clarity;
+        last.hz = o.hz;
+        last.stable = o.stable;
+      }
     } else {
-      out.push({ t: o.t, s: o.s, tone: o.tone, bands: o.bands });
+      out.push({
+        t: o.t,
+        s: o.s,
+        tone: o.tone,
+        bands: o.bands,
+        semi: o.semi,
+        clarity: o.clarity,
+        hz: o.hz,
+        stable: o.stable,
+      });
     }
   }
   return out;
@@ -258,11 +286,12 @@ function planPhrases(barEnergy, rng) {
  * 这样选键时能同时照顾「别连按同一个键」「两手均衡」「别老用某根手指」。
  */
 class LanePlanner {
-  constructor(rng, cfg, step, beatDur) {
+  constructor(rng, cfg, step, beatDur, pitchRel = () => 0) {
     this.rng = rng;
     this.cfg = cfg;
     this.step = step;
     this.beatDur = beatDur;
+    this.pitchRel = pitchRel;
     this.lastLane = -1;
     this.prevLane = -1;
     this.recent = [];
@@ -271,10 +300,22 @@ class LanePlanner {
     this.laneUse = [0, 0, 0, 0];
     this.lastChord = '';
     this.famIdx = -1;
+    // 旋律状态
+    this.lastSemi = NaN;
+    this.pitchLanePrev = -1;
+    this.pitchRun = 0;
+    // 诊断计数（pitchOffered=有音高可建议，pitchUsed=真的被采纳）
+    this.pitchOffered = 0;
+    this.pitchUsed = 0;
+    this.pitchRejected = 0;
+    this.srcMap = 0;
+    this.srcSeq = 0;
+    this.srcPick = 0;
+    this.srcJackGuard = 0;
   }
 
   /** 单个键的权重：把所有"手感规则"乘在一起 */
-  weigh(lane, isStrong) {
+  weigh(lane, isStrong, rel = 0) {
     const c = this.cfg;
     let s = 1;
 
@@ -306,11 +347,19 @@ class LanePlanner {
       else if (d === 1) s *= 1.15;
     }
 
+    // 6) 音高：高的往外侧（0 / 3），低的往内侧（1 / 2）。
+    //    这是"谱面是音乐的可视化"最直接的一条 —— 旋律上行时键位往外扩。
+    if (Math.abs(rel) > 0.4) {
+      const outer = lane === 0 || lane === 3;
+      if (rel > 0) s *= outer ? 1.55 : 0.66;
+      else s *= outer ? 0.66 : 1.55;
+    }
+
     return Math.max(0.001, s);
   }
 
-  pick(isStrong) {
-    const w = LANE_KEYS.map((l) => this.weigh(l, isStrong));
+  pick(isStrong, rel = 0) {
+    const w = LANE_KEYS.map((l) => this.weigh(l, isStrong, rel));
     return weightedPick(w, this.rng);
   }
 
@@ -338,12 +387,14 @@ class LanePlanner {
   }
 
   /** —— 等间隔连打的三种标准语汇 —— */
-  makeRoll(n, theme, vary) {
-    // 方向 / 起始键完全由乐句主题决定 —— 不能再因为"上一个音是什么"而改起点，
-    // 否则同一段音乐重复出现时会走成两条不同的线（一致性就没了）。
-    // 交界处的 jack 由调用方那个单点检查处理。
-    const dir = vary ? -theme.dir : theme.dir;
-    const start = theme.start;
+  makeRoll(n, theme, vary, dirOverride = 0) {
+    // 方向优先级：音高趋势 > 乐句主题。旋律整体上行时，连打就该往上走 ——
+    // 这既保留了 roll 的语汇感，又不至于把一条上行的旋律打成锯齿。
+    const dir = dirOverride || (vary ? -theme.dir : theme.dir);
+    // 起点同样跟着方向：上行从左起、下行从右起，避免一上来就顶到边界
+    let start = theme.start;
+    if (dirOverride > 0 && start > 1) start = 0;
+    if (dirOverride < 0 && start < 2) start = 3;
     const out = [];
     for (let i = 0; i < n; i++) {
       // 注意 JS 的 % 对负数返回负数，必须再 +4 归一化
@@ -353,12 +404,86 @@ class LanePlanner {
     return out;
   }
 
+  /** 一段连打的音高趋势：上行 +1 / 下行 -1 / 平 0（按前后三分之一的均值差判断） */
+  pitchTrend(items) {
+    const pts = [];
+    for (const it of items) {
+      if (it.stable && isFinite(it.semi) && (it.clarity || 0) >= PITCH_USE_CLARITY) pts.push(it.semi);
+    }
+    if (pts.length < 4) return 0;
+    const k = Math.max(1, Math.floor(pts.length / 3));
+    const head = pts.slice(0, k);
+    const tail = pts.slice(-k);
+    const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+    const d = avg(tail) - avg(head);
+    if (d > 1.5) return 1;
+    if (d < -1.5) return -1;
+    return 0;
+  }
+
   makeTrill(n, theme, vary) {
     let [a, b] = theme.pair;
     if (vary) [a, b] = [b, a]; // 后半句反过来，形成"呼应"而不是复制
     const out = [];
     for (let i = 0; i < n; i++) out.push(i % 2 === 0 ? a : b);
     return out;
+  }
+
+  /**
+   * 旋律走向 → 键位走向。返回建议键位（不保证被采用）。
+   *
+   * 三条依据：
+   *  - 音高上升 → 键位右移；下降 → 左移（幅度按音程大小给 1~2 格）
+   *  - 音高几乎不变（<0.45 半音）→ 允许**真 jack**。这是唯一合理的 jack 来源：
+   *    音乐上确实是同一个音重复，两个音就该落在同一个键上。但最多连两个。
+   *  - 撞到边界就反弹，避免整段堆在最右 / 最左
+   *
+   * 每次调用都会更新内部状态（即使建议没被采用），否则下一次的"音高差"会算错。
+   */
+  pitchLane(semi, real = true) {
+    this.repeatOK = false;
+    if (!isFinite(semi)) return -1;
+    const prev = this.lastSemi;
+    this.lastSemi = semi;
+
+    if (!isFinite(prev)) {
+      this.pitchRun = 0;
+      const p = this.placeByHeight(semi);
+      if (p >= 0) this.pitchLanePrev = p;
+      return p;
+    }
+
+    const d = semi - prev;
+    if (Math.abs(d) < 0.45) {
+      // 同一个音：可以真 jack，但必须是**实测**的重复音（插值出来的不算），
+      // 而且只连两个。否则整段同音高的补音会连成一片 jack。
+      if (!real || this.pitchRun >= 1) return -1;
+      // 真重复也不一定非要写成 jack：按难度给概率，EASY 基本避开，
+      // HARD 大方保留（这是唯一"讲道理"的 jack 来源）
+      if (this.rng() > (this.cfg.pitchJackChance ?? 0.5)) return -1;
+      this.pitchRun++;
+      this.repeatOK = true; // 只有这条路径允许"下一个音仍落在同一键"
+      return this.pitchLanePrev;
+    }
+
+    this.pitchRun = 0;
+    const base = this.pitchLanePrev >= 0 ? this.pitchLanePrev : this.lastLane;
+    if (base < 0) return -1;
+    const dir = d > 0 ? 1 : -1;
+    const mag = Math.abs(d) > 4.5 ? 2 : 1; // 大音程走两格
+    // 越过边界时**环绕**而不是反弹：4K 里 3→0 本来就被读作"继续上行"
+    // （roll 就是这么走的）。反弹会把方向反过来，旋律一上行键位反而左移。
+    const t = (((base + dir * mag) % 4) + 4) % 4;
+    this.pitchLanePrev = t;
+    return t;
+  }
+
+  /** 绝对音高：高的落到外侧（0 / 3），低的落在内侧（1 / 2） */
+  placeByHeight(semi) {
+    const rel = this.pitchRel(semi);
+    if (rel > 0.4) return this.rng() < 0.5 ? 0 : 3;
+    if (rel < -0.4) return this.rng() < 0.5 ? 1 : 2;
+    return -1;
   }
 
   /**
@@ -387,16 +512,23 @@ class LanePlanner {
       gaps.length >= 3 && gaps.every((g) => Math.abs(g - gaps[0]) < 0.15) && gaps[0] >= 0.9;
     const dense = uniform && gaps[0] <= 2.15; // 1/8 或更密
 
-    // 句内前两小节走"主题"，后两小节走"变体"：既一致又不机械
     const vary = barInPhrase >= 2;
     let seq = null;
-    if (dense && cfg.id !== 'easy' && theme && theme.kind !== 'free') {
+    // 这一小节有多少音带可信音高？够多就让旋律自己决定走向 ——
+    // 音高步进本身就是 ±1 的 roll 形态，既好听也符合连打的手感。
+    let pitchNotes = 0;
+    for (const it of items) if (it.stable && isFinite(it.semi)) pitchNotes++;
+    const pitchy = pitchNotes / items.length >= 0.6;
+
+    if (dense && cfg.id !== 'easy' && theme && theme.kind !== 'free' && !pitchy) {
+      // 旋律趋势优先于主题方向：上行的连打往上走，下行的往下走
+      const trend = this.pitchTrend(items);
       // trill 只覆盖两根键，连续用会让整段堆在中间两根键上。
       // 所以让它隔小节出现，其余小节用 roll 把四根键都走到。
       const useTrill = theme.kind === 'trill' ? barInPhrase % 2 === 1 : barInPhrase % 4 === 3;
       seq = useTrill
         ? this.makeTrill(items.length, theme, vary)
-        : this.makeRoll(items.length, theme, vary);
+        : this.makeRoll(items.length, theme, vary, trend);
     }
 
     const placed = [];
@@ -405,6 +537,13 @@ class LanePlanner {
       const rel = (it.t - barStart) / this.beatDur; // 0..4
       // 整拍 / 半拍都算重音位（反拍重音很常见）
       const isStrong = Math.abs(rel * 2 - Math.round(rel * 2)) < 0.12;
+
+      // 旋律：先算"按音高走向该去哪个键"，再决定采不采用
+      const hasPitch = !!it.stable && isFinite(it.semi) && (it.clarity || 0) >= PITCH_USE_CLARITY;
+      const prel = hasPitch ? this.pitchRel(it.semi) : 0;
+      const suggestion = hasPitch ? this.pitchLane(it.semi, !it.interp) : -1;
+      if (suggestion >= 0) this.pitchOffered++;
+      const pitchJack = hasPitch && suggestion >= 0 && this.repeatOK;
 
       let lane = -1;
       if (this.laneMap) {
@@ -422,6 +561,24 @@ class LanePlanner {
           }
         }
         if (bestD > 0.3) lane = -1; // 对不上就交回自由选择
+
+        // 位置对上了，还要看音高对不对得上。
+        // 段落复用表是"按位置照抄"，如果这一段音乐其实是新的（音高走向不同），
+        // 照抄出来的键位就与旋律无关了。所以音高差太多就不抄，交给旋律走向。
+        if (lane >= 0) {
+          let srcRel = null;
+          let bestD2 = Infinity;
+          for (const m of this.laneMap) {
+            const d = Math.abs(m.bar - barRel) * 0.8 + Math.abs(m.rel - relInBar) * 1.6;
+            if (d < bestD2) {
+              bestD2 = d;
+              srcRel = m.prel;
+            }
+          }
+          if (hasPitch && srcRel != null && isFinite(srcRel)) {
+            if (Math.abs(prel - srcRel) > 0.3) lane = -1;
+          }
+        }
 
         // 照抄也要管手感：查表结果如果让某一手严重过载、或变成"锚点"，
         // 就交回加权选择。否则一致性会把之前调好的平衡全毁了。
@@ -441,12 +598,24 @@ class LanePlanner {
         }
       }
       if (lane < 0 && seq) lane = seq[i];
-      if (lane < 0) lane = this.pick(isStrong);
-      // 语汇内部也要过一遍手感：万一撞上 jack 就改选
-      if (lane === this.lastLane) lane = this.pick(isStrong);
-      if (!(lane >= 0 && lane < 4)) lane = this.pick(isStrong); // 兜底，绝不让非法轨道漏出去
+      if (lane < 0 && suggestion >= 0) {
+        // 旋律建议也要过手平衡：别让一段旋律把一只手压死
+        const total = this.left + this.right;
+        const ratio = total >= 10 ? (suggestion < 2 ? this.left : this.right) / total : 0.5;
+        if (ratio < 0.7) lane = suggestion;
+        else this.pitchRejected++;
+      }
+      if (lane < 0) { lane = this.pick(isStrong, prel); this.srcPick++; }
+      else if (lane === suggestion) this.srcPitch = (this.srcPitch || 0) + 1;
+      else if (seq && lane === seq[i]) this.srcSeq++;
+      else this.srcMap++;
+      // 语汇内部也要过一遍手感：万一撞上 jack 就改选。
+      // 唯一的例外是"音高完全相同"——那是音乐上真正的重复音，jack 是对的。
+      if (lane === this.lastLane && !pitchJack) { lane = this.pick(isStrong, prel); this.srcJackGuard++; }
+      if (!(lane >= 0 && lane < 4)) lane = this.pick(isStrong, prel); // 兜底，绝不让非法轨道漏出去
 
-      placed.push({ t: it.t, lane, s: it.s, tone: it.tone, strong: isStrong });
+      if (suggestion >= 0 && lane === suggestion) this.pitchUsed++;
+      placed.push({ t: it.t, lane, s: it.s, tone: it.tone, strong: isStrong, semi: it.semi });
       this.commit(lane);
     }
 
@@ -459,14 +628,14 @@ class LanePlanner {
         const partner = this.partnerOf(n.lane);
         if (placed.some((m) => Math.abs(m.t - n.t) < 0.02 && m.lane === partner)) continue;
         this.lastChord = chordKey(n.lane, partner);
-        out.push({ t: n.t, lane: n.lane, type: 'tap', s: n.s, tone: n.tone });
-        out.push({ t: n.t, lane: partner, type: 'tap', s: n.s, tone: n.tone });
+        out.push({ t: n.t, lane: n.lane, type: 'tap', s: n.s, tone: n.tone, semi: n.semi });
+        out.push({ t: n.t, lane: partner, type: 'tap', s: n.s, tone: n.tone, semi: n.semi });
         n.emitted = true;
       }
     }
 
     for (const n of placed) {
-      if (!n.emitted) out.push({ t: n.t, lane: n.lane, type: 'tap', s: n.s, tone: n.tone });
+      if (!n.emitted) out.push({ t: n.t, lane: n.lane, type: 'tap', s: n.s, tone: n.tone, semi: n.semi });
     }
   }
 }
@@ -502,7 +671,18 @@ export function generateChart(analysis, diff, options = {}) {
     else if (inBeat === 0) bonus = 0.19;
     else if (inBeat === 4) bonus = 0.1;
     else if (inBeat % 2 === 0) bonus = 0.05;
-    const cand = { t, slot, s: e.s, tone: e.tone, bands: e.bands, pos, score: e.s + bonus };
+    const cand = {
+      t,
+      slot,
+      s: e.s,
+      tone: e.tone,
+      bands: e.bands,
+      pos,
+      score: e.s + bonus,
+      semi: e.semi,
+      clarity: e.clarity,
+      stable: e.stable,
+    };
     const prev = bySlot.get(slot);
     if (!prev || cand.score > prev.score) bySlot.set(slot, cand);
   }
@@ -567,7 +747,15 @@ export function generateChart(analysis, diff, options = {}) {
   picked.sort((a, b) => a.t - b.t);
 
   // ---- 3. 补音：把每小节填到目标密度（先定时间轴，再排键位）----
-  const timeline = picked.map((e) => ({ t: e.t, s: e.s, tone: e.tone, pos: e.pos }));
+  const timeline = picked.map((e) => ({
+    t: e.t,
+    s: e.s,
+    tone: e.tone,
+    pos: e.pos,
+    semi: e.semi,
+    clarity: e.clarity,
+    stable: e.stable,
+  }));
   const hasAt = (arr, t, tol) => arr.some((n) => Math.abs(n.t - t) < tol);
   if (cfg.allowFill) {
     const fstep = beatDur / cfg.fillDiv;
@@ -604,8 +792,43 @@ export function generateChart(analysis, diff, options = {}) {
     timeline.sort((a, b) => a.t - b.t);
   }
 
+  // ---- 3.5 补音的音高：按前后可信音高插值（当作经过音）----
+  // 不这么做，连打里"有音高的音"和"补出来的音"会交替出现，
+  // 旋律线就被切成一段一段，HARD 这类补音很多的难度尤其明显。
+  {
+    const anchors = timeline.filter((n) => n.stable && isFinite(n.semi)).sort((a, b) => a.t - b.t);
+    if (anchors.length > 4) {
+      let ai = 0;
+      for (const n of timeline) {
+        if (n.stable && isFinite(n.semi)) continue;
+        while (ai + 1 < anchors.length && anchors[ai + 1].t < n.t) ai++;
+        const prev = anchors[ai];
+        const next = anchors[ai + 1];
+        const before = prev && prev.t <= n.t + 1e-6;
+        const after = next && next.t >= n.t - 1e-6;
+        if (before && after && next.t - prev.t < beatDur * 2.6 && next.t > prev.t) {
+          const k = (n.t - prev.t) / (next.t - prev.t);
+          n.semi = prev.semi + (next.semi - prev.semi) * k;
+          n.stable = true;
+          n.interp = true;
+          n.clarity = 0.7; // 插值音高同样可信，否则会被 clarity 门槛挡掉
+        } else if (before && n.t - prev.t < beatDur * 0.9) {
+          n.semi = prev.semi;
+          n.stable = true;
+          n.interp = true;
+          n.clarity = 0.7;
+        } else if (after && next.t - n.t < beatDur * 0.9) {
+          n.semi = next.semi;
+          n.stable = true;
+          n.interp = true;
+          n.clarity = 0.7;
+        }
+      }
+    }
+  }
+
   // ---- 4. 键位编排：按乐句主题套语汇 ----
-  const planner = new LanePlanner(rng, cfg, step, beatDur);
+  const planner = new LanePlanner(rng, cfg, step, beatDur, analysis.pitchRel || (() => 0));
   const notes = [];
   const byBar = new Map();
   for (const n of timeline) {
@@ -615,12 +838,82 @@ export function generateChart(analysis, diff, options = {}) {
   }
   const allBars = [...byBar.keys()].sort((x, y) => x - y);
   const barSet = new Set(allBars);
-  // 每个档位只保留第一段的键位表，后续同档位的段落照着它排 ——
-  // 这就是"副歌不管出现几次，配置都是同一套"的实现方式。
+
+  // ---- 3.9 段落重复检测：用音级指纹，而不是"能量档位" ----
+  // 之前只按能量分档，结果把"能量相近但音乐完全不同"的两段当成一段照抄，
+  // 实测同档位段落的音高差有 5~9 个半音 —— 抄了也是错的。
+  // 现在比的是每小节的音级分布（chroma）：真正的副歌重复会高度吻合。
+  const segRepeat = new Map();
+  {
+    const chromaOf = new Map();
+    for (const bar of allBars) {
+      const v = new Float32Array(12);
+      let cnt = 0;
+      for (const n of byBar.get(bar)) {
+        if (!isFinite(n.semi)) continue;
+        const pc = ((Math.round(n.semi) % 12) + 12) % 12;
+        v[pc] += 1;
+        cnt++;
+      }
+      if (cnt >= 2) {
+        for (let i = 0; i < 12; i++) v[i] /= cnt;
+        chromaOf.set(bar, v);
+      }
+    }
+    const cos = (a, b) => {
+      let d = 0;
+      let na = 0;
+      let nb = 0;
+      for (let i = 0; i < 12; i++) {
+        d += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+      }
+      return !na || !nb ? 0 : d / Math.sqrt(na * nb);
+    };
+    for (let i = 1; i < struct.segs.length; i++) {
+      const A = struct.segs[i];
+      let best = -1;
+      let bestS = -1;
+      for (let j = 0; j < i; j++) {
+        const B = struct.segs[j];
+        if (B.tier !== A.tier) continue;
+        const len = Math.min(A.len, B.len);
+        if (len < 4) continue;
+        let sum = 0;
+        let cnt = 0;
+        for (let k = 0; k < len; k++) {
+          const ca = chromaOf.get(A.start + k);
+          const cb = chromaOf.get(B.start + k);
+          if (!ca || !cb) continue;
+          sum += cos(ca, cb);
+          cnt++;
+        }
+        if (cnt >= len * 0.6 && sum / cnt > bestS) {
+          bestS = sum / cnt;
+          best = j;
+        }
+      }
+      // 阈值 0.93：宁可漏判（各写各的），也不能把不相关的段落凑一对
+      if (best >= 0 && bestS > 0.93) segRepeat.set(i, best);
+    }
+  }
+
+  // 每个"首次出现"的段落留一份键位表，真正的重复段落照抄它。
+  // 音级指纹没命中时退回"同档位复用"（老逻辑），但照抄时仍然要过音高闸门，
+  // 所以"能量相近但音乐不同"的段落不会被硬抄。
+  const segLaneMaps = new Map();
   const tierLaneMaps = new Map();
 
-  for (const sg of struct.segs) {
-    const laneMap = sg.tier > 0 ? tierLaneMaps.get(sg.tier) : null;
+  for (let si = 0; si < struct.segs.length; si++) {
+    const sg = struct.segs[si];
+    const srcIdx = segRepeat.has(si) ? segRepeat.get(si) : -1;
+    const laneMap =
+      srcIdx >= 0
+        ? segLaneMaps.get(srcIdx) || null
+        : sg.tier > 0
+          ? tierLaneMaps.get(sg.tier) || null
+          : null;
     const segStart = firstBeat + sg.start * barDur;
     const segDur = sg.len * barDur;
     const startIdx = notes.length;
@@ -641,7 +934,21 @@ export function generateChart(analysis, diff, options = {}) {
       );
     }
 
-    if (sg.tier > 0 && !laneMap && notes.length > startIdx) {
+    if (sg.tier > 0 && !laneMap && notes.length > startIdx && !tierLaneMaps.has(sg.tier)) {
+      const map = [];
+      for (let i = startIdx; i < notes.length; i++) {
+        const barIdx = (notes[i].t - segStart) / barDur;
+        map.push({
+          bar: barIdx,
+          rel: barIdx - Math.floor(barIdx),
+          lane: notes[i].lane,
+          prel: isFinite(notes[i].semi) ? analysis.pitchRel(notes[i].semi) : null,
+        });
+      }
+      tierLaneMaps.set(sg.tier, map);
+    }
+
+    if (!laneMap && notes.length > startIdx) {
       const map = [];
       for (let i = startIdx; i < notes.length; i++) {
         const barIdx = (notes[i].t - segStart) / barDur;
@@ -649,9 +956,11 @@ export function generateChart(analysis, diff, options = {}) {
           bar: barIdx,
           rel: barIdx - Math.floor(barIdx), // 小节内 0..1
           lane: notes[i].lane,
+          // 记下当时的相对音高，供后续段落判断"是不是同一段音乐"
+          prel: isFinite(notes[i].semi) ? analysis.pitchRel(notes[i].semi) : null,
         });
       }
-      tierLaneMaps.set(sg.tier, map);
+      segLaneMaps.set(si, map);
     }
   }
 
@@ -745,7 +1054,20 @@ export function generateChart(analysis, diff, options = {}) {
     duration,
     seed: hashString(`${cfg.id}:${Math.round(analysis.bpm * 10)}`),
     // 结构信息（诊断用）：乐句数、其中多少句复用了别的乐句的主题
-    structure: { segments: struct.segs.map((x) => ({ tier: x.tier, start: x.start, len: x.len })) },
+    structure: {
+      segments: struct.segs.map((x) => ({ tier: x.tier, start: x.start, len: x.len })),
+      repeats: [...segRepeat.entries()],
+    },
+    pitchStats: {
+      offered: planner.pitchOffered,
+      used: planner.pitchUsed,
+      rejected: planner.pitchRejected,
+      srcPitch: planner.srcPitch || 0,
+      srcSeq: planner.srcSeq,
+      srcMap: planner.srcMap,
+      srcPick: planner.srcPick,
+      srcJackGuard: planner.srcJackGuard,
+    },
     ...options,
   };
 }

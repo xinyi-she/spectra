@@ -1,4 +1,5 @@
 import { FFT, hann } from './fft.js';
+import { downsample, isolateMelody, yinPitch } from './pitch.js';
 
 /**
  * 音频分析引擎
@@ -163,6 +164,98 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
     o.tone = bands[4] > bands[0] * 1.15 ? 'hat' : bands[2] + bands[3] > bands[0] * 1.1 ? 'snare' : 'kick';
   }
 
+  // ---- 4.5 基频检测（旋律走向用）----
+  // 只在 onset 之后取窗：起音瞬态没有稳定周期，会污染估计。
+  onProgress(0.72, '分析音高');
+  const CLARITY_MIN = 0.5;
+  const ds = downsample(mono, sampleRate, 12000);
+  const pRate = ds.rate;
+  // 滤掉贝斯：不这么做，YIN 会锁在"低八度"（110Hz 与 220Hz 的共同周期是 110Hz）
+  const pSig = isolateMelody(ds.data, pRate);
+  const pWin = Math.round(0.058 * pRate); // ~58ms，够看清 90Hz 的五个周期
+  const pLead = Math.round(0.016 * pRate); // 跳过起音瞬态
+  const pLen = pSig.length;
+  const semis = [];
+  for (const o of onsets) {
+    const start = Math.round(o.t * pRate) + pLead;
+    if (start + pWin >= pLen) {
+      o.hz = 0;
+      o.clarity = 0;
+      o.semi = NaN;
+      continue;
+    }
+    const r = yinPitch(pSig, start, pWin, pRate, 90, 1100);
+    o.hz = r.hz;
+    o.clarity = r.clarity;
+    o.semi = r.semi;
+    if (r.clarity >= CLARITY_MIN && isFinite(r.semi)) semis.push(r.semi);
+  }
+
+  // 音高分布：中位数 + 10~90 分位跨度，谱面用它把"绝对音高"换成"相对高低"
+  let pitchMedian = NaN;
+  let pitchLo = NaN;
+  let pitchHi = NaN;
+  if (semis.length >= 8) {
+    const sortedSemi = semis.slice().sort((a, b) => a - b);
+    const q = (p) => sortedSemi[Math.max(0, Math.min(sortedSemi.length - 1, Math.round((sortedSemi.length - 1) * p)))];
+    pitchMedian = q(0.5);
+    pitchLo = q(0.1);
+    pitchHi = q(0.9);
+  }
+  /** 相对音高：-1（低）..0（中位）..+1（高） */
+  const pitchRelAt = (semi) => {
+    if (!isFinite(semi) || !isFinite(pitchMedian)) return 0;
+    const span = Math.max(1.5, (pitchHi - pitchLo) / 2 || 1);
+    return Math.max(-1, Math.min(1, (semi - pitchMedian) / span));
+  };
+
+  // ---- 4.6 音高稳定性闸门 ----
+  // 复音混音里 YIN 会在贝斯 / 人声 / 吉他之间来回跳 —— 实测相邻两个音的
+  // 音高差常在 7~11 个半音之间，那是"换了声部"，不是旋律在走。
+  // 所以只保留"附近还有音高相近的音"的检测结果：旋律线是连续的，
+  // 孤立的跳变一律当成不可信，交回节奏驱动的编排。
+  const STABLE_WIN = 0.42; // 秒
+  const STABLE_TOL = 3; // 半音
+  const idxWin = Math.max(1, Math.round(STABLE_WIN / frameDur));
+  let stableCount = 0;
+  for (let i = 0; i < onsets.length; i++) {
+    const o = onsets[i];
+    if (!isFinite(o.semi) || (o.clarity || 0) < CLARITY_MIN) {
+      o.stable = false;
+      continue;
+    }
+    let support = 0;
+    const lo = Math.max(0, i - idxWin);
+    const hi = Math.min(onsets.length - 1, i + idxWin);
+    for (let j = lo; j <= hi; j++) {
+      if (j === i) continue;
+      const p = onsets[j];
+      if (!isFinite(p.semi) || (p.clarity || 0) < CLARITY_MIN) continue;
+      if (Math.abs(p.semi - o.semi) <= STABLE_TOL) support++;
+    }
+    o.stable = support >= 1;
+    if (o.stable) stableCount++;
+  }
+
+  // ---- 4.7 音高轨中值滤波 ----
+  // 单点跳变（偶尔锁到另一个声部）会把旋律线打成锯齿，也会让"同一段音乐
+  // 出现两次"的谱面不一致。3 点中值只削掉孤立的尖峰，真实的大跳会保留。
+  {
+    const idxs = [];
+    for (let i = 0; i < onsets.length; i++) if (onsets[i].stable) idxs.push(i);
+    const src = idxs.map((i) => onsets[i].semi);
+    for (let k = 1; k < idxs.length - 1; k++) {
+      const a = src[k - 1];
+      const b = src[k];
+      const c = src[k + 1];
+      const med = Math.max(Math.min(a, b), Math.min(Math.max(a, b), c));
+      // 只在"自己是孤立尖峰"时替换（与两侧都差得多）
+      if (Math.abs(med - b) < 9 && Math.abs(a - b) > 2 && Math.abs(c - b) > 2) {
+        onsets[idxs[k]].semi = med;
+      }
+    }
+  }
+
   // ---- 5. BPM ----
   onProgress(0.8, '估算 BPM');
   const lagMin = Math.max(2, Math.round(0.28 / frameDur));
@@ -307,9 +400,22 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
     rms,
     energy: { bass: energy[0], low: energy[1], mid: energy[2], high: energy[3], air: energy[4] },
     onsets,
+    pitch: {
+      median: pitchMedian,
+      lo: pitchLo,
+      hi: pitchHi,
+      clarityMin: CLARITY_MIN,
+      pitchedCount: semis.length,
+      stableCount,
+      coverage: onsets.length ? semis.length / onsets.length : 0,
+      stableCoverage: onsets.length ? stableCount / onsets.length : 0,
+    },
+    /** 某个 onset 的相对音高 -1..1（低→高）；无音高时返回 0 */
+    pitchRel: pitchRelAt,
     stats: {
       onsetCount: onsets.length,
       bpm,
+      pitched: semis.length,
     },
     energyAt(t) {
       const f = Math.round(t / frameDur);

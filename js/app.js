@@ -214,7 +214,7 @@ async function loadAudioBuffer(arrayBuffer, song, opts = {}) {
     await nextFrame();
 
     const result = await runAnalysis(buffer, setAnalyze);
-    state.analysis = result.analysis;
+    state.analysis = ensurePitchRel(result.analysis);
     state.charts = result.charts;
     state.analyzeMs = result.ms.analysis;
     state.cache = { key: song.key, buffer, analysis: result.analysis, charts: result.charts, ms: result.ms.analysis };
@@ -297,9 +297,10 @@ function runAnalysis(buffer, onProgress) {
         const analysis = analyzeAudio(mono, buffer.sampleRate);
         const charts = generateAll(analysis);
         const ms = { analysis: Math.round(performance.now() - t0), charts: 0 };
-        const { energyAt, beatAt, ...plain } = analysis;
+        const { energyAt, beatAt, pitchRel, ...plain } = analysis;
         void energyAt;
         void beatAt;
+        void pitchRel;
         finish(resolve, { analysis: plain, charts, ms });
       } catch (err) {
         finish(reject, err);
@@ -323,8 +324,21 @@ function runAnalysis(buffer, onProgress) {
       worker.terminate();
       inline();
     };
-    worker.postMessage({ samples: mono, sampleRate: buffer.sampleRate }, [mono.buffer]);
+    // 用副本传：transfer 会让 mono 变成零长度，一旦 worker 失败要回退到
+    // 主线程分析时就没有数据了（表现为"分析 8ms、0 个音符"）
+    const payload = mono.slice();
+    worker.postMessage({ samples: payload, sampleRate: buffer.sampleRate }, [payload.buffer]);
   });
+}
+
+/** worker 传回的分析结果里没有函数，这里按统计量重建 pitchRel */
+function ensurePitchRel(analysis) {
+  if (!analysis || analysis.pitchRel) return analysis;
+  const { median, lo, hi } = analysis.pitch || {};
+  const span = Math.max(1.5, (hi - lo) / 2 || 1);
+  analysis.pitchRel = (semi) =>
+    !isFinite(semi) || !isFinite(median) ? 0 : Math.max(-1, Math.min(1, (semi - median) / span));
+  return analysis;
 }
 
 function setAnalyze(pct, step, meta) {
@@ -337,7 +351,7 @@ function setAnalyze(pct, step, meta) {
 function restoreCache() {
   const c = state.cache;
   state.buffer = c.buffer;
-  state.analysis = c.analysis;
+  state.analysis = ensurePitchRel(c.analysis);
   state.charts = c.charts;
   state.analyzeMs = c.ms;
   showReady();
