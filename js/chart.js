@@ -57,7 +57,7 @@ export const DIFFICULTIES = [
     maxPerBar: 11,
     allowChord: true,
     // 目标双押率（按位置权重缩放后约等于"音群中双押以上的比例"）
-    chordBase: 0.20,
+    chordBase: 0.17,
     allowFill: true,
     fillRate: 0.3,
     holdChance: 0.1,
@@ -84,7 +84,7 @@ export const DIFFICULTIES = [
     npsLoud: 7.0,
     maxPerBar: 20,
     allowChord: true,
-    chordBase: 0.42,
+    chordBase: 0.33,
     allowFill: true,
     fillRate: 0.7,
     holdChance: 0.05,

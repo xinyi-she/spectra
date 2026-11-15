@@ -131,7 +131,8 @@ for (const c of charts) {
       const prev = groups[i - 1];
       const dtBeats = (g.t - prev.t) / c.beat;
       const unit = Math.round(dtBeats * 16); // 以 1/16 拍为单位（4 = 1/4 拍）
-      if (unit > 0 && unit <= 4) bump(ioiBuckets, unit);
+      // 不要截断：只统计 ≤1/4 拍的间隔会把长间隔从分母里剔掉，比例被整体抬高
+      if (unit > 0 && unit <= 64) bump(ioiBuckets, unit);
       gapHist.push(dtBeats);
 
       // jack：单音 -> 单音，且间距在 1/4 拍内

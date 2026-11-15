@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { analyzeAudio } from '../js/analyzer.js';
 import { generateAll } from '../js/chart.js';
+import { PRIORS } from '../js/chart-priors.js';
 
 const ROOT = path.dirname(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1');
 
@@ -119,7 +120,9 @@ function parseOsu(text) {
 
 const realAgg = { quarter: 0, eighth: 0, sixteenth: 0, dotted: 0, phase0: 0, phaseOn: 0, chord: 0, motif: 0, barP50: 0, barP90: 0, n: 0 };
 const dir = path.join(ROOT, '_charts');
-for (const f of fs.readdirSync(dir)) {
+// 语料目录不在时（没跑 fetch_charts）直接用蒸馏好的常量兜底
+const hasCorpus = fs.existsSync(dir);
+for (const f of hasCorpus ? fs.readdirSync(dir) : []) {
   if (!f.endsWith('.osu')) continue;
   const c = parseOsu(fs.readFileSync(path.join(dir, f), 'utf8'));
   if (!c || c.notes.length < 200) continue;
@@ -130,7 +133,24 @@ for (const f of fs.readdirSync(dir)) {
   realAgg.n++;
 }
 const real = {};
-for (const k of Object.keys(realAgg)) real[k] = k === 'n' ? realAgg.n : realAgg[k] / realAgg.n;
+if (hasCorpus && realAgg.n > 0) {
+  for (const k of Object.keys(realAgg)) real[k] = k === 'n' ? realAgg.n : realAgg[k] / realAgg.n;
+} else {
+  // 数值来自 js/chart-priors.js 的蒸馏结果（160 张谱面 / 479,479 音符）
+  Object.assign(real, {
+    notes: 0,
+    quarter: PRIORS.ioi.quarter * 100,
+    eighth: PRIORS.ioi.eighth * 100,
+    sixteenth: PRIORS.ioi.sixteenth * 100,
+    dotted: PRIORS.ioi.dotted * 100,
+    phase0: PRIORS.phase[0] * 100,
+    phaseOn: (PRIORS.phase[0] + PRIORS.phase[4] + PRIORS.phase[8] + PRIORS.phase[12]) * 100,
+    chord: (PRIORS.chordSize[1] + PRIORS.chordSize[2] + PRIORS.chordSize[3]) * 100,
+    motif: 20.0, // 重音计入后的实测值（见 README）
+    barP50: PRIORS.perBar.p50,
+    barP90: PRIORS.perBar.p90,
+  });
+}
 
 // ---- 自动生成 ----
 const raw = fs.readFileSync(process.argv[2]);
