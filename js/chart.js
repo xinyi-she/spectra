@@ -5,10 +5,13 @@ import { mulberry32 } from './fft.js';
  * ------------------------------------------------------------------
  * 输入音频分析结果 → 输出三档难度（EASY / NORMAL / HARD）的 4K 谱面。
  *
- * 关键点：**所有音符都吸附到拍网格上**。
- *   人的耳朵判「准不准」看的是音符与拍点的关系，而不是与某个瞬态的关系。
- *   原始 onset 相对拍点有 ±20ms 的抖动，直接拿来排谱会让人觉得「松 / 慢半拍」，
- *   所以先按 1/4（EASY/NORMAL）或 1/8（HARD）拍吸附，再做选音与编排。
+ * 三条硬规则（来自 osu!mania / StepMania 的通行经验）：
+ *   1. 音符必须落在拍网格上。人的耳朵判「准不准」看的是与拍点的关系，
+ *      原始 onset 有 ±20ms 抖动，直接排谱会显得「松 / 慢半拍」。
+ *   2. **jack（同键连打）只能用在「音乐上完全相同的两个音」**。
+ *      随机产生 jack 必然难打 —— 这是自动谱面最容易犯的错。
+ *   3. 键位要「有语汇」：等间隔连打走 roll / trill，零散音走自由跳，
+ *      重音才给双押。整段随机游走会让人觉得「在瞎拍」。
  */
 
 export const DIFFICULTIES = [
@@ -31,6 +34,12 @@ export const DIFFICULTIES = [
     maxNps: 3.6,
     levelBase: 1,
     levelScale: 1.15,
+    // 手感参数
+    jack: 0.09,      // 同键连打权重
+    trill: 1.6,
+    jump: 0.5,       // 大跳（跨 3 个键）降权，EASY 尽量走相邻
+    handBias: 1.35,
+    anchor: 0.18,
   },
   {
     id: 'normal',
@@ -52,6 +61,11 @@ export const DIFFICULTIES = [
     maxNps: 6.2,
     levelBase: 4.5,
     levelScale: 0.75,
+    jack: 0.09,
+    trill: 1.8,
+    jump: 0.65,
+    handBias: 1.45,
+    anchor: 0.22,
   },
   {
     id: 'hard',
@@ -73,87 +87,28 @@ export const DIFFICULTIES = [
     maxNps: 11.8,
     levelBase: 8,
     levelScale: 0.62,
+    jack: 0.035,     // 高速下同键连打几乎不可接受
+    trill: 2.0,
+    jump: 0.55,
+    handBias: 1.5,
+    anchor: 0.26,
   },
 ];
 
-const MOTIFS = {
-  1: [[1], [2], [0], [3]],
-  2: [
-    [0, 3],
-    [1, 2],
-    [0, 2],
-    [3, 1],
-    [2, 3],
-    [1, 0],
-  ],
-  3: [
-    [0, 1, 2],
-    [3, 2, 1],
-    [0, 2, 3],
-    [1, 0, 3],
-    [2, 1, 0],
-    [1, 2, 3],
-  ],
-  4: [
-    [0, 1, 2, 3],
-    [3, 2, 1, 0],
-    [0, 3, 1, 2],
-    [1, 0, 2, 3],
-    [0, 2, 1, 3],
-    [2, 1, 3, 0],
-  ],
-  5: [
-    [0, 1, 2, 3, 2],
-    [1, 0, 2, 3, 1],
-    [0, 1, 0, 2, 3],
-    [3, 2, 3, 1, 0],
-    [2, 1, 0, 2, 3],
-  ],
-  6: [
-    [0, 1, 0, 2, 1, 3],
-    [0, 1, 2, 1, 0, 2],
-    [1, 0, 1, 2, 3, 2],
-    [3, 2, 3, 1, 0, 1],
-    [0, 1, 2, 3, 2, 1],
-  ],
-  7: [
-    [0, 1, 0, 1, 2, 3, 2],
-    [0, 1, 2, 3, 0, 1, 2],
-    [1, 0, 1, 0, 2, 3, 2],
-    [3, 2, 3, 2, 1, 0, 1],
-  ],
-  8: [
-    [0, 1, 2, 3, 3, 2, 1, 0],
-    [0, 1, 0, 1, 2, 3, 2, 3],
-    [0, 1, 2, 1, 0, 1, 2, 3],
-    [3, 2, 1, 2, 3, 2, 1, 0],
-  ],
+const LANE_KEYS = [0, 1, 2, 3];
+
+/** 双押组合的舒适度权重：外外 > 外内 > 内内（1-2 食指内收最别扭） */
+const CHORD_COMFORT = {
+  '0-3': 1.0,
+  '0-2': 0.7,
+  '1-3': 0.7,
+  '1-2': 0.12,
+  '0-1': 0.14,
+  '2-3': 0.14,
 };
 
-function hashString(s) {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-
-function pickMotif(count, rng, prevLast) {
-  const table = MOTIFS[Math.min(8, Math.max(1, count))] || MOTIFS[8];
-  let best = table[Math.floor(rng() * table.length)];
-  for (let tries = 0; tries < 4; tries++) {
-    const cand = table[Math.floor(rng() * table.length)];
-    if (cand[0] !== prevLast) {
-      best = cand;
-      break;
-    }
-  }
-  if (count <= 8) return best.slice();
-  const out = [];
-  const zig = [0, 1, 2, 3, 3, 2, 1, 0];
-  for (let i = 0; i < count; i++) out.push(zig[i % 8]);
-  return out;
+function chordKey(a, b) {
+  return a < b ? a + '-' + b : b + '-' + a;
 }
 
 /** 把距离很近的击打点并成一个音符事件 */
@@ -192,7 +147,6 @@ function barIntensity(analysis, firstBeat, beatDur) {
     }
     raw[b] = cnt ? sum / cnt : 0;
   }
-  // 相邻小节平滑，避免逐小节抖动
   const sm = new Float32Array(nBars);
   for (let b = 0; b < nBars; b++) {
     const a = raw[Math.max(0, b - 1)];
@@ -207,6 +161,209 @@ function barIntensity(analysis, firstBeat, beatDur) {
   const out = new Float32Array(nBars);
   for (let b = 0; b < nBars; b++) out[b] = Math.max(0, Math.min(1, (sm[b] - lo) / den));
   return out;
+}
+
+function hashString(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function weightedPick(weights, rng) {
+  const sum = weights.reduce((a, b) => a + b, 0);
+  if (!(sum > 0)) return Math.floor(rng() * weights.length);
+  let r = rng() * sum;
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return i;
+  }
+  return weights.length - 1;
+}
+
+/**
+ * 键位编排器
+ * 跨小节维护状态：上一个键、上上个键、近期手指使用率、锚点计数，
+ * 这样选键时能同时照顾「别连按同一个键」「两手均衡」「别老用某根手指」。
+ */
+class LanePlanner {
+  constructor(rng, cfg, step, beatDur) {
+    this.rng = rng;
+    this.cfg = cfg;
+    this.step = step;
+    this.beatDur = beatDur;
+    this.lastLane = -1;
+    this.prevLane = -1;
+    this.recent = [];
+    this.left = 0;
+    this.right = 0;
+    this.lastChord = '';
+    this.famIdx = -1;
+  }
+
+  /** 单个键的权重：把所有"手感规则"乘在一起 */
+  weigh(lane, isStrong) {
+    const c = this.cfg;
+    let s = 1;
+
+    // 1) 同键连打：只有"音乐上完全相同的两个音"才该出现，
+    //    自动排谱判断不了，所以一律重罚（重音也不例外）
+    if (lane === this.lastLane) s *= c.jack;
+
+    // 2) 交替（trill）：上上个键就是它，且上一个不是 → 形成 ABAB，最好打
+    if (lane === this.prevLane && lane !== this.lastLane) s *= c.trill;
+
+    // 3) 手平衡：近期少用的那只手加权
+    const total = this.left + this.right;
+    if (total >= 6) {
+      const ratio = (lane < 2 ? this.left : this.right) / total;
+      if (ratio < 0.4) s *= c.handBias;
+      else if (ratio > 0.6) s *= 1 / c.handBias;
+    }
+
+    // 4) 锚点：最近 8 个音里这根键用太多次就压一压
+    const win = this.recent.slice(-8);
+    const same = win.filter((l) => l === lane).length;
+    if (same >= 2) s *= Math.max(0.12, 1 - (same - 1) * c.anchor);
+
+    // 5) 移动距离：相邻移动最顺手，大跳降权但保留变化
+    if (this.lastLane >= 0) {
+      const d = Math.abs(lane - this.lastLane);
+      if (d === 3) s *= c.jump;
+      else if (d === 2) s *= 0.92;
+      else if (d === 1) s *= 1.15;
+    }
+
+    return Math.max(0.001, s);
+  }
+
+  pick(isStrong) {
+    const w = LANE_KEYS.map((l) => this.weigh(l, isStrong));
+    return weightedPick(w, this.rng);
+  }
+
+  commit(lane) {
+    this.prevLane = this.lastLane;
+    this.lastLane = lane;
+    this.recent.push(lane);
+    if (this.recent.length > 24) this.recent.shift();
+    if (lane < 2) this.left++;
+    else this.right++;
+  }
+
+  /** 双押的第二键：按舒适度选，避免连续同型 */
+  partnerOf(lane) {
+    const w = [0, 0, 0, 0];
+    for (const l of LANE_KEYS) {
+      if (l === lane) continue;
+      const key = chordKey(lane, l);
+      let base = CHORD_COMFORT[key] || 0.1;
+      if (key === this.lastChord) base *= 0.2;
+      w[l] = base;
+    }
+    return weightedPick(w, this.rng);
+  }
+
+  /** —— 等间隔连打的三种标准语汇 —— */
+  makeRoll(n) {
+    const dir = this.rng() < 0.5 ? 1 : -1;
+    let start = Math.floor(this.rng() * 4);
+    // 起点别贴着上一个键，避免小节交界处 jack
+    if (start === this.lastLane) start = (start + 2) % 4;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      // 注意 JS 的 % 对负数返回负数，必须再 +4 归一化
+      const l = (((start + dir * i) % 4) + 4) % 4;
+      out.push(l);
+    }
+    return out;
+  }
+
+  makeTrill(n) {
+    // 六种键对按舒适度加权：跨手最优，1-2（两根食指内收）最少用
+    const pairs = [
+      { p: [0, 3], w: 1.15 },
+      { p: [0, 2], w: 1.1 },
+      { p: [1, 3], w: 1.1 },
+      { p: [1, 2], w: 0.85 },
+      { p: [0, 1], w: 0.95 },
+      { p: [2, 3], w: 0.95 },
+    ];
+    const pair = pairs[weightedPick(pairs.map((x) => x.w), this.rng)].p;
+    // 从离上一个键更远的那根开始，手感更自然
+    let a = pair[0];
+    let b = pair[1];
+    if (Math.abs(this.lastLane - a) < Math.abs(this.lastLane - b)) [a, b] = [b, a];
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(i % 2 === 0 ? a : b);
+    return out;
+  }
+
+  /**
+   * 排一个小节。
+   * items: [{ t, s }] 已按时间排序；bar 用于决定语汇轮换；eBar 是强度。
+   */
+  planBar(items, bar, eBar, out, barDur, firstBeat) {
+    if (!items.length) return;
+    const { rng, cfg, step } = this;
+
+    // 节奏型识别：等间隔且够密 → 用连打语汇；否则自由跳
+    const gaps = [];
+    for (let i = 1; i < items.length; i++) gaps.push((items[i].t - items[i - 1].t) / step);
+    const uniform =
+      gaps.length >= 3 && gaps.every((g) => Math.abs(g - gaps[0]) < 0.15) && gaps[0] >= 0.9;
+    const dense = uniform && gaps[0] <= 2.15; // 1/8 或更密
+
+    // 每两小节换一次语汇，四小节一个循环，避免整首一个味道
+    const fam = ((Math.floor(bar / 2) + (uniform ? 1 : 0)) % 2);
+    let seq = null;
+    if (dense && cfg.id !== 'easy') {
+      if (fam === 0) seq = this.makeRoll(items.length);
+      else seq = this.makeTrill(items.length);
+    }
+
+    const placed = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const rel = (it.t - (firstBeat + bar * barDur)) / this.beatDur; // 0..4
+      // 整拍 / 半拍都算重音位（反拍重音很常见），越靠整拍越强
+      const isStrong = Math.abs(rel * 2 - Math.round(rel * 2)) < 0.12;
+
+      let lane;
+      if (seq) {
+        lane = seq[i];
+        // 语汇内部也要过一遍手感：万一撞上 jack 就改选
+        if (lane === this.lastLane) lane = this.pick(isStrong);
+      } else {
+        lane = this.pick(isStrong);
+      }
+      if (!(lane >= 0 && lane < 4)) lane = this.pick(isStrong); // 兜底，绝不让非法轨道漏出去
+
+      placed.push({ t: it.t, lane, s: it.s, tone: it.tone, strong: isStrong });
+      this.commit(lane);
+    }
+
+    // 双押：只在强拍 + 足够炸的段落出现
+    if (cfg.allowChord && eBar > 0.6) {
+      const p = Math.min(0.5, (eBar - 0.6) * 1.8 * (cfg.chordChance + 0.16));
+      for (const n of placed) {
+        if (!n.strong) continue;
+        if (rng() > p) continue;
+        const partner = this.partnerOf(n.lane);
+        if (placed.some((m) => Math.abs(m.t - n.t) < 0.02 && m.lane === partner)) continue;
+        this.lastChord = chordKey(n.lane, partner);
+        out.push({ t: n.t, lane: n.lane, type: 'tap', s: n.s, tone: n.tone });
+        out.push({ t: n.t, lane: partner, type: 'tap', s: n.s, tone: n.tone });
+        n.emitted = true;
+      }
+    }
+
+    for (const n of placed) {
+      if (!n.emitted) out.push({ t: n.t, lane: n.lane, type: 'tap', s: n.s, tone: n.tone });
+    }
+  }
 }
 
 export function generateChart(analysis, diff, options = {}) {
@@ -224,6 +381,7 @@ export function generateChart(analysis, diff, options = {}) {
   const slotOf = (t) => Math.round((t - firstBeat) / step);
   const timeOf = (s) => firstBeat + s * step;
   const barDur = beatDur * 4;
+  const barOf = (t) => Math.floor((t - firstBeat) / barDur);
 
   // ---- 1. 事件吸附到拍网格（同一格只留最强的一个）----
   const bySlot = new Map();
@@ -232,7 +390,6 @@ export function generateChart(analysis, diff, options = {}) {
     const slot = slotOf(e.t);
     const t = timeOf(slot);
     if (Math.abs(t - e.t) > step * 0.55) continue;
-    // 位置（以 1/8 槽为单位，一小节 32 槽）
     const pos = ((Math.round(((t - firstBeat) / beatDur) * 8) % 32) + 32) % 32;
     const inBeat = pos % 8;
     let bonus = 0;
@@ -246,7 +403,6 @@ export function generateChart(analysis, diff, options = {}) {
   }
   let events = [...bySlot.values()].sort((a, b) => a.t - b.t);
 
-  // EASY：明显不在拍/半拍上的弱音不要
   if (cfg.id === 'easy') {
     events = events.filter((e) => {
       const p = e.pos % 8;
@@ -255,9 +411,8 @@ export function generateChart(analysis, diff, options = {}) {
     });
   }
 
-  // ---- 2. 局部强度 → 每小节目标密度（高潮更密、主歌留白）----
+  // ---- 2. 局部强度 → 每小节目标密度 ----
   const curve = barIntensity(analysis, firstBeat, beatDur);
-  const barOf = (t) => Math.floor((t - firstBeat) / barDur);
   const barCand = new Map();
   for (const e of events) {
     const b = barOf(e.t);
@@ -272,9 +427,10 @@ export function generateChart(analysis, diff, options = {}) {
     return Math.max(0, Math.min(1, loud * 0.76 + busy * 0.24));
   };
 
-  const chosen = [];
+  const barKeys = [...barCand.keys()].sort((x, y) => x - y);
   const barTarget = new Map();
-  for (const b of [...barCand.keys()].sort((x, y) => x - y)) {
+  const picked = [];
+  for (const b of barKeys) {
     const e = barEnergy(b);
     const target = Math.max(
       1,
@@ -286,56 +442,23 @@ export function generateChart(analysis, diff, options = {}) {
     for (const ev of list) {
       if (taken >= target) break;
       let ok = true;
-      for (let i = 0; i < chosen.length; i++) {
-        if (Math.abs(chosen[i].t - ev.t) < cfg.minGap) {
+      for (let i = 0; i < picked.length; i++) {
+        if (Math.abs(picked[i].t - ev.t) < cfg.minGap) {
           ok = false;
           break;
         }
       }
       if (ok) {
-        chosen.push(ev);
+        picked.push(ev);
         taken++;
       }
     }
   }
-  chosen.sort((a, b) => a.t - b.t);
+  picked.sort((a, b) => a.t - b.t);
 
-  // ---- 3. 按小节分配键位 ----
-  const notes = [];
-  let prevLast = -1;
-  const bars = new Map();
-  for (const e of chosen) {
-    const b = barOf(e.t);
-    if (!bars.has(b)) bars.set(b, []);
-    bars.get(b).push(e);
-  }
-  const barKeys = [...bars.keys()].sort((a, b) => a - b);
-
-  for (const bar of barKeys) {
-    const list = bars.get(bar).sort((a, b) => a.t - b.t);
-    const eBar = barEnergy(bar);
-    let lanes = pickMotif(list.length, rng, prevLast);
-
-    for (let i = 0; i < list.length; i++) {
-      notes.push({ t: list[i].t, lane: lanes[i], type: 'tap', s: list[i].s, tone: list[i].tone });
-    }
-
-    // 高潮段：随机补双押，密度和"炸"的感觉都上来了
-    if (cfg.allowChord && eBar > 0.62) {
-      const p = Math.min(0.55, (eBar - 0.62) * 2.1 * (cfg.chordChance + 0.2));
-      for (let i = 0; i < list.length; i++) {
-        if (rng() > p) continue;
-        const l = lanes[i];
-        const partner = l === 0 ? 3 : l === 3 ? 0 : l === 1 ? 2 : 1;
-        if (notes.some((x) => Math.abs(x.t - list[i].t) < 0.02 && x.lane === partner)) continue;
-        notes.push({ t: list[i].t, lane: partner, type: 'tap', s: list[i].s, tone: list[i].tone });
-      }
-    }
-
-    prevLast = lanes[lanes.length - 1];
-  }
-
-  // ---- 4. 密度补全：把每小节填到该响度对应的目标密度 ----
+  // ---- 3. 补音：把每小节填到目标密度（先定时间轴，再排键位）----
+  const timeline = picked.map((e) => ({ t: e.t, s: e.s, tone: e.tone, pos: e.pos }));
+  const hasAt = (arr, t, tol) => arr.some((n) => Math.abs(n.t - t) < tol);
   if (cfg.allowFill) {
     const fstep = beatDur / cfg.fillDiv;
     const added = [];
@@ -343,35 +466,44 @@ export function generateChart(analysis, diff, options = {}) {
       const t0 = firstBeat + bar * barDur;
       const eBar = barEnergy(bar);
       const target = barTarget.get(bar) || 4;
-      let have = notes.filter((n) => n.t >= t0 - 0.01 && n.t < t0 + barDur - 0.01).length;
-      if (have >= target) continue;
-      if (eBar < 0.34) continue;
+      let have = timeline.filter((n) => n.t >= t0 - 0.01 && n.t < t0 + barDur - 0.01).length;
+      if (have >= target || eBar < 0.34) continue;
 
-      // 空槽优先补：按该位置的击打强度排序
       const slots = [];
       for (let k = 0; k < 4 * cfg.fillDiv; k++) {
         const t = t0 + k * fstep;
         if (t >= t0 + barDur - 0.02) break;
-        if (notes.some((n) => Math.abs(n.t - t) < fstep * 0.45)) continue;
-        if (added.some((n) => Math.abs(n.t - t) < fstep * 0.45)) continue;
-        slots.push({ t, s: strengthAt(t) });
+        if (hasAt(timeline, t, fstep * 0.45) || hasAt(added, t, fstep * 0.45)) continue;
+        // 补音优先补"本来就有声音"的位置，别凭空插
+        const s = strengthAt(t);
+        if (s < 0.07) continue;
+        slots.push({ t, s, beatInBar: k / cfg.fillDiv });
       }
       slots.sort((p, q) => q.s - p.s);
-      const minS = eBar > 0.7 ? 0.08 : 0.17;
+      const minS = eBar > 0.7 ? 0.09 : 0.18;
       for (const sl of slots) {
         if (have >= target) break;
         if (sl.s < minS) break;
-        if (rng() < 0.12) continue;
-        added.push({ t: sl.t, lane: -1, type: 'tap', s: sl.s, tone: 'hat' });
+        if (rng() < 0.1) continue;
+        added.push({ t: sl.t, s: sl.s, tone: 'hat', pos: null });
         have++;
       }
     }
-    for (const f of added) {
-      const prev = [...notes].filter((n) => n.t < f.t).pop();
-      const l = prev ? (prev.lane + (rng() < 0.5 ? 1 : 3)) % 4 : 1;
-      if (notes.some((n) => Math.abs(n.t - f.t) < 0.02 && n.lane === l)) continue;
-      notes.push({ ...f, lane: l });
-    }
+    timeline.push(...added);
+    timeline.sort((a, b) => a.t - b.t);
+  }
+
+  // ---- 4. 键位编排：按小节识别节奏型，套用语汇 ----
+  const planner = new LanePlanner(rng, cfg, step, beatDur);
+  const notes = [];
+  const byBar = new Map();
+  for (const n of timeline) {
+    const b = barOf(n.t);
+    if (!byBar.has(b)) byBar.set(b, []);
+    byBar.get(b).push(n);
+  }
+  for (const b of [...byBar.keys()].sort((x, y) => x - y)) {
+    planner.planBar(byBar.get(b), b, barEnergy(b), notes, barDur, firstBeat);
   }
 
   notes.sort((a, b) => a.t - b.t || a.lane - b.lane);
@@ -397,25 +529,27 @@ export function generateChart(analysis, diff, options = {}) {
     limited.push(n);
   }
 
-  // ---- 6. 长条 ----
+  // ---- 6. 长条：留给"有空隙的强拍"，别跟连打抢位置 ----
   const withHolds = [];
-  for (let i = 0; i < limited.length; i++) {
-    const n = limited[i];
-    const next = limited[i + 1];
-    if (
-      n.type === 'tap' &&
-      rng() < cfg.holdChance &&
-      next &&
-      next.t - n.t > beatDur * 0.9 &&
-      analysis.energyAt(n.t + beatDur * 0.6) > 0.5
-    ) {
-      const dur = Math.min(beatDur * 2, next.t - n.t - beatDur * 0.3);
-      if (dur > beatDur * 0.5) {
-        withHolds.push({ ...n, type: 'hold', dur });
-        continue;
-      }
+  const sorted = limited.slice().sort((a, b) => a.t - b.t);
+  for (let i = 0; i < sorted.length; i++) {
+    const n = sorted[i];
+    const prev = sorted[i - 1];
+    const prevSame = prev && prev.lane === n.lane && n.t - prev.t < beatDur * 1.2;
+    if (n.type !== 'tap' || prevSame || rng() > cfg.holdChance * 1.1) {
+      withHolds.push(n);
+      continue;
     }
-    withHolds.push(n);
+    // 长条可以跨过别的轨道的音，只要本轨道后面没有更近的音
+    const nextSame = sorted.slice(i + 1).find((m) => m.lane === n.lane);
+    const limit = nextSame ? nextSame.t - beatDur * 0.28 : n.t + beatDur * 3;
+    const dur = Math.min(beatDur * 2.5, limit - n.t);
+    // 太短没意义；长条要落在"有声音"的地方
+    if (dur > beatDur * 0.75 && analysis.energyAt(n.t + beatDur * 0.5) > 0.3) {
+      withHolds.push({ ...n, type: 'hold', dur });
+    } else {
+      withHolds.push(n);
+    }
   }
   const holds = withHolds.filter((n) => n.type === 'hold');
   const final = withHolds.filter((n) => {
@@ -429,7 +563,7 @@ export function generateChart(analysis, diff, options = {}) {
     if (n.type !== 'tap') continue;
     if (n.t - lastSpecial < beatDur * 6) continue;
     const pos = ((Math.round(((n.t - firstBeat) / beatDur) * 8) % 32) + 32) % 32;
-    if (pos % 8 !== 0 && pos % 8 !== 4) continue; // 只放整拍 / 半拍
+    if (pos % 8 !== 0 && pos % 8 !== 4) continue;
     if (n.s < 0.55) continue;
     if (rng() < cfg.specialChance) {
       n.type = 'special';
