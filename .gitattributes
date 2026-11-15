@@ -1,0 +1,9 @@
+# .bat / .cmd 必须原样保留 CRLF：cmd.exe 解析多行 if (...) 块和 goto 时依赖 CR，
+# 用 LF 会导致窗口一闪就退、报语法错误。用 -text 关闭行尾转换，仓库里也存 CRLF。
+*.bat -text
+*.cmd -text
+
+*.png binary
+*.jpg binary
+*.mp3 binary
+*.m4a binary
