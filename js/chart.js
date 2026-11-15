@@ -37,15 +37,13 @@ export const DIFFICULTIES = [
      * 密度可以贴近人类，间隔必须比人类宽。
      */
     hold: {
-      share: 0.05,        // 目标占比
-      minBeats: 1.5,      // 最短 1.5 拍 —— 短于这个读起来像"卡了一下"
-      maxBeats: 4,
-      breathBeats: 1.0,   // 尾巴后同轨至少留 1 拍（人类 p50 是 0.75）
-      headGapBeats: 3,    // 两个长条头至少隔 3 拍
-      perBar: 1,
-      phraseBars: 3,      // 一次最多连写 3 小节（人类是"成段"出现）
-      coverage: 0.45,     // 全曲最多多少比例的小节带长条
-      handPerBeat: 2.0,   // 长条期间同一只手每拍最多再打 2 个音
+      share: 0.004,       // Sparebeat easy 实测 0.3%：整首歌 1 根
+      minBeats: 1,
+      maxBeats: 2.5,
+      breathBeats: 1.0,
+      headGapBeats: 4,
+      phraseBars: 2,
+      coverage: 0.05,
       sustain: 0.35,
     },
     specialChance: 0.02,
@@ -70,23 +68,24 @@ export const DIFFICULTIES = [
     fillDiv: 2,
     minGap: 0.135,
     npsQuiet: 1.9,
-    npsLoud: 4.6,
+    npsLoud: 4.3,
     maxPerBar: 11,
     allowChord: true,
     // 目标双押率（按位置权重缩放后约等于"音群中双押以上的比例"）
-    chordBase: 0.17,
+    // 骨架里有多少比例的槽位成为"重音位"，以及重音位上加倍的概率。
+    // 目标：双押以上的音群占比 ≈ Sparebeat 实测的 12%（normal）/ 23%（hard）。
+    chordSlotShare: 0.15,
+    chordProb: 0.8,
     allowFill: true,
-    fillRate: 0.3,
+    fillRate: 0.25,
     hold: {
-      share: 0.055,
-      minBeats: 1.5,
-      maxBeats: 4,
+      share: 0.014,       // Sparebeat normal 实测 1.4%
+      minBeats: 1,
+      maxBeats: 2.5,
       breathBeats: 0.85,
-      headGapBeats: 2.5,
-      perBar: 1,
-      phraseBars: 4,
-      coverage: 0.5,
-      handPerBeat: 2.8,
+      headGapBeats: 3,
+      phraseBars: 2,
+      coverage: 0.1,
       sustain: 0.35,
     },
     specialChance: 0.05,
@@ -109,26 +108,25 @@ export const DIFFICULTIES = [
     fillDiv: 4,
     minGap: 0.082,
     npsQuiet: 3.2,
-    npsLoud: 7.0,
+    npsLoud: 5.8,
     maxPerBar: 20,
     allowChord: true,
-    chordBase: 0.33,
+    chordSlotShare: 0.28,
+    chordProb: 0.85,
     allowFill: true,
-    fillRate: 0.7,
+    fillRate: 0.45,
     hold: {
-      share: 0.06,
-      minBeats: 1.0,
-      maxBeats: 3,
+      share: 0.022,       // Sparebeat hard 实测 2.1%
+      minBeats: 1,
+      maxBeats: 2.5,
       breathBeats: 0.75,
       headGapBeats: 2,
-      perBar: 1,
-      phraseBars: 4,
-      coverage: 0.55,
-      handPerBeat: 4.2,
+      phraseBars: 2,
+      coverage: 0.14,
       sustain: 0.32,
     },
     specialChance: 0.07,
-    maxNps: 11.8,
+    maxNps: 9.6,
     levelBase: 8,
     levelScale: 0.62,
     jack: 0.035,     // 高速下同键连打几乎不可接受
@@ -665,11 +663,14 @@ class LanePlanner {
     // 也就是说重音该压在正拍和半拍上 —— 按这个权重撒，才会有"顿"的感觉；
     // 均匀撒满或者只在强拍撒一点，都会显得平。
     if (cfg.allowChord && eBar > 0.32) {
-      const base = cfg.chordBase * (0.35 + 1.15 * eBar);
       const cm = this.chordMask;
+      const chordP = cfg.chordProb ?? 0.9;
       for (const n of placed) {
-        const relBeat = (n.t - barStart) / this.beatDur; // 0..4
-        const slot = ((Math.round((relBeat % 1) * 16) % 16) + 16) % 16;
+        // 槽位必须是"小节内第几个十六分位置"（0..15），才和 chordMask 的索引空间一致。
+        // 这里原来写的是 `relBeat % 1`，取的是**拍内**位置，跟 16 格的小节掩码对不上，
+        // 于是重音位几乎处处命中，双押率被顶到 60% 以上 —— 这是"节奏很吵"的根源。
+        const relBar = (n.t - barStart) / barDur;
+        const slot = ((Math.round(relBar * 16) % 16) + 16) % 16;
         // 动机槽位上的音按权重加成；不在动机上的只有很小的机会，
         // 这样"重音位置"每小节都是一样的，玩家能跟着点头。
         // 动机槽位上的双押接近"确定"（0.9），其余位置几乎不出（0.06）：
@@ -677,7 +678,7 @@ class LanePlanner {
         // 没有动机的小节（只靠补音撑起来的）不能当成"全是重音位"，
         // 否则会把整小节塞满双押。兜底只认 0 / 8 两个正拍。
         const onMotif = cm ? !!cm[slot] : slot % 8 === 0;
-        const p = onMotif ? 0.92 : 0.02;
+        const p = onMotif ? chordP : 0.02;
         if (rng() > p) continue;
         const partner = this.partnerOf(n.lane);
         if (placed.some((m) => Math.abs(m.t - n.t) < 0.02 && m.lane === partner)) continue;
@@ -752,7 +753,7 @@ function sustainSpan(analysis, t, maxLen, minLen) {
   return { len: end, q };
 }
 
-function placeHolds(notes, analysis, cfg, beatDur, stats = null) {
+function placeHolds(notes, analysis, cfg, beatDur, rng, stats = null) {
   const H = cfg.hold;
   if (!H) return notes;
 
@@ -762,17 +763,25 @@ function placeHolds(notes, analysis, cfg, beatDur, stats = null) {
   const minLen = H.minBeats * beatDur;
   const breath = H.breathBeats * beatDur;
   const budget = Math.max(1, Math.round(notes.length * H.share));
+  const half = beatDur / 2;
 
   // 同轨索引
   const byLane = [[], [], [], []];
   for (const n of notes) byLane[n.lane].push(n);
   for (const a of byLane) a.sort((x, y) => x.t - y.t);
 
-  // ---- 1. 候选：结构上接得住 + 声音在延续 ----
+  // ---- 1. 候选 ----
   const cands = [];
-  const rej = { room: 0, quiet: 0, sustain: 0 };
+  const rej = { room: 0, quiet: 0, sustain: 0, grid: 0 };
   for (const n of notes) {
     if (n.type !== 'tap') continue;
+    // 长条头必须落在 1/2 拍网格上。Sparebeat 官方谱面实测：66% 在整拍、
+    // 29% 在"&"、**0% 落在奇数十六分位** —— 长条从半格中间开始是最难读的。
+    const hb = (n.t - firstBeat) / half;
+    if (Math.abs(hb - Math.round(hb)) > 0.08) {
+      rej.grid++;
+      continue;
+    }
     const lane = byLane[n.lane];
     const next = lane[lane.indexOf(n) + 1];
     const stop = next ? next.t : n.t + (H.maxBeats + H.breathBeats) * beatDur;
@@ -790,24 +799,25 @@ function placeHolds(notes, analysis, cfg, beatDur, stats = null) {
       rej.sustain++;
       continue;
     }
-
-    // 正拍上的长条更好读，给一点点加成
     const beats = (n.t - firstBeat) / beatDur;
     const onBeat = Math.abs(beats - Math.round(beats)) < 0.06;
-    // 弱音上开长条没有说服力
     const strength = Math.min(1, (n.s || 0.5) * 1.6);
-    cands.push({ n, len: span.len, q: span.q * (0.7 + 0.3 * strength) * (onBeat ? 1.15 : 1) });
+    cands.push({ n, len: span.len, q: span.q * (0.7 + 0.3 * strength) * (onBeat ? 1.3 : 1) });
   }
   if (stats) Object.assign(stats, rej, { cands: cands.length, budget });
   if (!cands.length) return notes;
 
-  // ---- 2. 每小节留一个最好的候选，再把相邻小节连成短语 ----
+  // ---- 2. 每小节留一个最好的候选 ----
   const barBest = new Map();
   for (const c of cands) {
     const b = barOf(c.n.t);
     const cur = barBest.get(b);
     if (!cur || c.q > cur.q) barBest.set(b, c);
   }
+
+  // ---- 3. 成段挑选：长条只在"某几个乐句"里出现 ----
+  // Sparebeat 实测：只有 8% 的小节含长条，最长连续 2 小节，而长条占音符 2%。
+  // 也就是说长条是**局部现象**，一出现就是一小段"长条句"，然后长时间没有。
   const barList = [...barBest.keys()].sort((a, b) => a - b);
   const phrases = [];
   let run = [];
@@ -819,49 +829,36 @@ function placeHolds(notes, analysis, cfg, beatDur, stats = null) {
     }
   }
   if (run.length) phrases.push(run);
-  // 长短语优先；短片段也不至于被丢光
   const phraseScore = (ph) => ph.reduce((s, b) => s + barBest.get(b).q, 0) / Math.sqrt(ph.length);
   phrases.sort((a, b) => phraseScore(b) - phraseScore(a));
 
-  // 先把短语按分数挑出来，再**按时间顺序**落地。
-  // （先挑后排是必要的：间距检查依赖"上一个长条"的位置，
-  //   如果按分数乱序落地，时间会来回跳，间距判断全错。）
   const barCount = Math.max(1, Math.round((notes[notes.length - 1].t - notes[0].t) / barDur));
-  const maxBars = Math.round(barCount * (H.coverage || 0.5));
-  const picked = [];
+  const maxBars = Math.max(1, Math.round(barCount * (H.coverage || 0.1)));
+  const planned = [];
   let barsPlanned = 0;
   for (const ph of phrases) {
     if (barsPlanned >= maxBars) break;
     const take = Math.min(ph.length, H.phraseBars);
-    if (barsPlanned + take > maxBars && picked.length) continue;
-    picked.push({ ph, take, start: Math.floor((ph.length - take) / 2) });
+    if (barsPlanned + take > maxBars && planned.length) continue;
+    planned.push({ ph, take, start: Math.floor((ph.length - take) / 2) });
     barsPlanned += take;
   }
-  picked.sort((a, b) => a.ph[a.start] - b.ph[b.start]);
+  // 先挑后排：间距检查依赖"上一个长条"的位置，乱序落地会把时间判断搞错
+  planned.sort((a, b) => a.ph[a.start] - b.ph[b.start]);
 
-  // ---- 3. 按时间顺序放置，带间隔 / 同手负荷检查 ----
-  const chosen = new Map(); // note -> {len}
+  // ---- 4. 落地 ----
+  const chosen = new Map(); // note -> len
   const laneFreeAt = [0, 0, 0, 0];
-  // 同一只手也要留呼吸：上一根长条刚松手，紧接着同一只手又开一根，
-  // 手指要先抬再按，EASY 难度下这就是"反人类"的来源。
   const handFreeAt = [0, 0];
   let lastHead = -1e9;
   const drop = { gap: 0, lane: 0, hand: 0 };
-  const handBusy = (lane, t, len) => {
-    const left = lane < 2;
-    let busy = 0;
-    for (const m of notes) {
-      if (m.t <= t + 0.03 || m.t >= t + len - 0.03) continue;
-      if ((m.lane < 2) === left) busy++;
-    }
-    return busy;
-  };
 
-  for (const { ph, take, start } of picked) {
+  for (const { ph, take, start } of planned) {
     if (chosen.size >= budget) break;
     for (let i = start; i < start + take; i++) {
       if (chosen.size >= budget) break;
       const c = barBest.get(ph[i]);
+      if (!c) continue;
       const t = c.n.t;
       if (t - lastHead < H.headGapBeats * beatDur) {
         drop.gap++;
@@ -876,10 +873,6 @@ function placeHolds(notes, analysis, cfg, beatDur, stats = null) {
         drop.hand++;
         continue;
       }
-      if (handBusy(c.n.lane, t, c.len) > H.handPerBeat * (c.len / beatDur) + 1) {
-        drop.hand++;
-        continue;
-      }
       chosen.set(c.n, c.len);
       laneFreeAt[c.n.lane] = t + c.len + breath;
       handFreeAt[hand] = t + c.len + breath;
@@ -889,14 +882,35 @@ function placeHolds(notes, analysis, cfg, beatDur, stats = null) {
   if (stats) Object.assign(stats, drop, { chosen: chosen.size, phrases: phrases.length });
   if (!chosen.size) return notes;
 
-  // ---- 4. 落盘：被长条盖住的同轨音直接删掉（不留"按住还要再按"） ----
-  const holds = notes.filter((n) => chosen.has(n)).map((n) => ({ t: n.t, lane: n.lane, end: n.t + chosen.get(n) }));
-  return notes
-    .filter((n) => {
-      if (chosen.has(n)) return true;
-      return !holds.some((h) => h.lane === n.lane && n.t > h.t + 0.02 && n.t < h.end - 0.02);
-    })
-    .map((n) => (chosen.has(n) ? { ...n, type: 'hold', dur: chosen.get(n) } : n));
+  // ---- 5. 长条期间"让位"----
+  // Sparebeat 实测：长条期间**只有 7%** 的情况别的轨还有音。
+  // 之前我们只在同轨删音，别的三轨照样在打 —— 这就是"中间夹一个长条很难受"：
+  // 手要按住，同时还要在别的键上连打。现在长条一出现，这一小段就让给它。
+  const spans = [...chosen.entries()].map(([n, len]) => ({ t: n.t, lane: n.lane, end: n.t + len }));
+  const keepUnderHold = (h) => h.end - h.t >= 2 * beatDur && rng() < 0.2;
+
+  const out = [];
+  const keptUnder = new Map(); // span -> 已保留的数量
+  for (const n of notes) {
+    if (chosen.has(n)) {
+      out.push({ ...n, type: 'hold', dur: chosen.get(n) });
+      continue;
+    }
+    const h = spans.find((s) => n.t > s.t + 0.03 && n.t < s.end - 0.03);
+    if (!h) {
+      out.push(n);
+      continue;
+    }
+    // 同轨：一律删（否则要"按住还要再按"）
+    if (h.lane === n.lane) continue;
+    // 别的轨：默认删；长条够长时允许偶尔留一个音，保持一点层次
+    if (!keepUnderHold(h)) continue;
+    const used = keptUnder.get(h) || 0;
+    if (used >= 1) continue;
+    keptUnder.set(h, used + 1);
+    out.push(n);
+  }
+  return out;
 }
 
 export function generateChart(analysis, diff, options = {}) {
@@ -1026,14 +1040,15 @@ export function generateChart(analysis, diff, options = {}) {
       const peak = Math.max(...group.map((b) => barTarget.get(b) || 0));
       // 目标数的是"音符"，双押会被算两次；这里换算成"音群数"再定槽位数，
       // 否则一条 16 格的节奏骨架上会被塞进远超骨架的音符，动机就没了。
-      const groups = Math.round(peak / (1 + 0.5 * (cfg.allowChord ? cfg.chordBase : 0)));
+      const groups = Math.round(peak / (1 + 0.5 * (cfg.allowChord ? (cfg.chordSlotShare || 0) * (cfg.chordProb || 0) : 0)));
       const K = Math.max(3, Math.min(16, groups));
       const mask = new Uint8Array(16);
       for (let c = 0; c < K; c++) mask[order[c]] = 1;
       // 正拍必须踩：人类谱面 96% 的小节都在正拍上放了音（实测 165 张 4K 谱）。
       // 骨架按平均强度挑格子，偶尔会把正拍漏掉 —— 那一小节就"不在点上"了。
       const peakSlot = Math.max(...slotStrength);
-      if (peakSlot > 0 && slotStrength[0] >= peakSlot * 0.4) mask[0] = 1;
+      // 阈值放到 15%：人类谱面 94% 的小节都在正拍上放了音，宁可多踩一脚。
+      if (peakSlot > 0 && slotStrength[0] >= peakSlot * 0.15) mask[0] = 1;
 
       // 双押槽位：**必须从音符骨架里挑**，否则会出现"有音就双押"。
       // 取骨架的 1/3 左右作为重音位，优先正拍/半拍（真实重音的 77% 在这两处）。
@@ -1043,7 +1058,7 @@ export function generateChart(analysis, diff, options = {}) {
         (x, y) =>
           slotStrength[y] * CHORD_SLOT_WEIGHT[y] - slotStrength[x] * CHORD_SLOT_WEIGHT[x]
       );
-      const k2 = Math.max(1, Math.min(4, Math.round(maskSlots.length * 0.18)));
+      const k2 = Math.max(1, Math.min(6, Math.round(maskSlots.length * (cfg.chordSlotShare ?? 0.18))));
       const chordMask = new Uint8Array(16);
       for (let c = 0; c < k2 && c < chordOrder.length; c++) chordMask[chordOrder[c]] = 1;
 
@@ -1078,7 +1093,7 @@ export function generateChart(analysis, diff, options = {}) {
     let best = null;
     for (const ev of barCand.get(b)) {
       const d = Math.abs(ev.t - t0);
-      if (d <= barDur / 16 && (!best || d < Math.abs(best.t - t0))) best = ev;
+      if (d <= barDur / 10 && (!best || d < Math.abs(best.t - t0))) best = ev;
     }
     if (best) barDownbeat.set(b, best.t);
   }
@@ -1368,7 +1383,7 @@ export function generateChart(analysis, diff, options = {}) {
 
   // ---- 6. 长条：只写在"接得住、成段、有呼吸"的位置 ----
   const holdStats = {};
-  const final = placeHolds(limited.slice().sort((a, b) => a.t - b.t), analysis, cfg, beatDur, holdStats);
+  const final = placeHolds(limited.slice().sort((a, b) => a.t - b.t), analysis, cfg, beatDur, rng, holdStats);
 
   // ---- 7. 特殊音符（需配合空格，双倍分数）----
   let lastSpecial = -9;

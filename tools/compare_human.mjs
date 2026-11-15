@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chartMetrics, holdMetrics } from '../js/metrics.js';
+import { parseSparebeat } from './sparebeat.mjs';
 
 const ROOT = path.dirname(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1');
 const DIR = path.join(ROOT, '_charts');
@@ -80,6 +81,33 @@ const med = (arr, k) => {
   return s[Math.round((s.length - 1) * 0.5)];
 };
 
+// ---- Sparebeat 官方谱面（同一把尺子） ----
+const SB_DIR = path.join(ROOT, '_sbmaps');
+const sb = [];
+if (fs.existsSync(SB_DIR)) {
+  for (const f of fs.readdirSync(SB_DIR)) {
+    if (!f.endsWith('.json')) continue;
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(path.join(SB_DIR, f), 'utf8'));
+    } catch {
+      continue;
+    }
+    for (const diff of ['easy', 'normal', 'hard']) {
+      const p = parseSparebeat(data, diff);
+      if (!p || p.notes.length < 50) continue;
+      const span = p.notes[p.notes.length - 1].t - p.notes[0].t || 1;
+      sb.push({
+        diff,
+        level: (data.level || {})[diff] ?? null,
+        nps: p.notes.length / span,
+        cm: chartMetrics(p.notes, p.beat, p.offset),
+        hm: holdMetrics(p.notes, p.beat, p.offset),
+      });
+    }
+  }
+}
+
 const gen = JSON.parse(fs.readFileSync(path.join(ROOT, '_gen_charts.json'), 'utf8'));
 const mine = gen.charts.map((c) => {
   const notes = c.notes.map((n) => ({ t: n.t, col: n.lane, hold: n.type === 'hold', dur: n.dur || 0 }));
@@ -115,21 +143,26 @@ const COLS = [
   ['长p50', (r) => F(r.hm.lenP50)],
   ['连条', (r) => P(r.hm.chainShare)],
   ['即按', (r) => P(r.hm.tailTight)],
+  ['条小节', (r) => P(r.hm.holdCoverage)],
 ];
 
 const rows = [];
-rows.push(['人类·全部 (' + real.length + '张)', null, real]);
+for (const [label, diff] of [['Sparebeat easy', 'easy'], ['Sparebeat normal', 'normal'], ['Sparebeat hard', 'hard']]) {
+  const list = sb.filter((r) => r.diff === diff);
+  if (list.length >= 3) rows.push([`${label} (${list.length})`, null, list]);
+}
+rows.push(['osu!mania·全部 (' + real.length + '张)', null, real]);
 const tiers = [
   ['≤3★', (s) => s !== null && s < 3],
-  ['3~4.2★', (s) => s !== null && s >= 3 && s < 4.2],
-  ['4.2~5.2★', (s) => s !== null && s >= 4.2 && s < 5.2],
-  ['5.2★+', (s) => s !== null && s >= 5.2],
+  ['osu 3~4.2★', (s) => s !== null && s >= 3 && s < 4.2],
+  ['osu 4.2~5.2★', (s) => s !== null && s >= 4.2 && s < 5.2],
+  ['osu 5.2★+', (s) => s !== null && s >= 5.2],
 ];
 for (const [label, pred] of tiers) {
   const list = real.filter((r) => pred(r.star));
-  if (list.length >= 3) rows.push([`人类 ${label} (${list.length}张)`, null, list]);
+  if (list.length >= 3) rows.push([`${label} (${list.length}张)`, null, list]);
 }
-rows.push(['人类·混合长条 (' + mixed.length + '张)', null, mixed]);
+rows.push(['osu·混合长条 (' + mixed.length + '张)', null, mixed]);
 for (const m of mine) rows.push(['本作 ' + m.name, m, null]);
 
 const head = COLS.map((c) => c[0]);
@@ -150,8 +183,11 @@ for (const [label, single, list] of rows) {
 const md = [
   '# 人类谱面 vs 自动谱面',
   '',
-  `真实样本：osu!mania 4K，${real.length} 张谱面（单 BPM、≥120 音符）。表内为**每张谱面指标的中位数**。`,
+  `Sparebeat 样本：${sb.length} 张官方谱面（三档难度）。`,
+  `osu!mania 样本：${real.length} 张 4K 谱面（单 BPM、≥120 音符）。`,
   `自动样本：${gen.song}（${gen.bpm.toFixed(1)} BPM）的三档难度。`,
+  '',
+  '表内均为**每张谱面指标的中位数**。',
   '',
   ...lines,
   '',

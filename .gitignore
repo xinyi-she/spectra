@@ -31,3 +31,7 @@ tools/_picked.json
 tools/_hold_priors.json
 tools/_gen_charts.json
 tools/compare_report.md
+
+# Sparebeat 官方谱面（只做统计，不随代码分发）
+tools/_sbmaps/
+tools/_sparebeat_priors.json

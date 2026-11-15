@@ -259,9 +259,15 @@ export function holdMetrics(notes, beat, offset = 0) {
     }
   }
 
+  // 含长条的小节占比 —— 人类谱面长条是"局部现象"，不是每小节都有
+  const allBars = new Set();
+  for (const nn of ns) allBars.add(Math.floor((nn.t - offset) / barDur));
+  const holdCoverage = allBars.size ? perBar.size / allBars.size : 0;
+
   return {
     notes: ns.length,
     holds: holds.length,
+    holdCoverage,
     holdShare: holds.length / total,
     lenP10: pct(lens, 0.1),
     lenP50: pct(lens, 0.5),
