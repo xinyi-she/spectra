@@ -184,6 +184,75 @@ function weightedPick(weights, rng) {
 }
 
 /**
+ * 乐句主题 = 一个短句的"说法"：走 roll 还是 trill、从哪个键起、往哪个方向。
+ * 同一段音乐重复出现时复用它，玩家才能"学会"这一句。
+ */
+function makeTheme(rng) {
+  // 只用"跨手"键对：0-1 / 2-3 是同手 trill，一整段都由一只手打，
+  // 既累又会把整段音符堆到一侧（4K 里属于特殊技巧，不该自动谱默认用）。
+  // 四对等权，刚好让每根键出现频率一致。
+  const pairs = [
+    { p: [0, 3], w: 1 },
+    { p: [0, 2], w: 1 },
+    { p: [1, 3], w: 1 },
+    { p: [1, 2], w: 1 },
+  ];
+  const r = rng();
+  return {
+    kind: r < 0.42 ? 'roll' : r < 0.8 ? 'trill' : 'free',
+    dir: rng() < 0.5 ? 1 : -1,
+    start: Math.floor(rng() * 4),
+    pair: pairs[weightedPick(pairs.map((x) => x.w), rng)].p,
+  };
+}
+
+/**
+ * 段落规划：4 小节一个乐句，乐句之间按"能量 / 音符密度 / 上升趋势"比相似度，
+ * 足够像就判定为「同一段音乐的重复」，复用同一个主题。
+ *
+ * 这是"一致性"的来源 —— 副歌重复两次，配置也重复，玩家能预判下一拍。
+ * 阈值故意压得比较严（0.5σ）：宁可漏判，也不能把不相关的段落强行配对。
+ */
+function planPhrases(barEnergy, rng) {
+  const nBars = barEnergy.length;
+  // 按能量分三档：安静 / 正常 / 高潮。档位决定了"这一段该长什么样"。
+  const tierOf = (e) => (e > 0.62 ? 2 : e > 0.34 ? 1 : 0);
+
+  // 连续同档的小节 = 一个段落
+  const segs = [];
+  for (let b = 0; b < nBars; b++) {
+    const t = tierOf(barEnergy[b]);
+    const last = segs[segs.length - 1];
+    if (last && last.tier === t) last.len++;
+    else segs.push({ tier: t, start: b, len: 1 });
+  }
+  // 太短的段落并到前一段，避免 1 小节的档位抖动把结构打碎
+  const merged = [];
+  for (const sg of segs) {
+    const prev = merged[merged.length - 1];
+    if (prev && sg.len < 2) {
+      prev.len += sg.len;
+    } else {
+      merged.push({ ...sg });
+    }
+  }
+
+  // 每个档位两套主题（主 / 副），同一档位的不同段落交替使用，
+  // 既保证"同类段落风格一致"，又不会整首一个味道。
+  const pools = [
+    [makeTheme(rng), makeTheme(rng)],
+    [makeTheme(rng), makeTheme(rng)],
+    [makeTheme(rng), makeTheme(rng)],
+  ];
+  const used = [0, 0, 0];
+  for (const sg of merged) {
+    sg.theme = pools[sg.tier][used[sg.tier] % 2];
+    used[sg.tier]++;
+  }
+  return { segs: merged, nBars };
+}
+
+/**
  * 键位编排器
  * 跨小节维护状态：上一个键、上上个键、近期手指使用率、锚点计数，
  * 这样选键时能同时照顾「别连按同一个键」「两手均衡」「别老用某根手指」。
@@ -199,6 +268,7 @@ class LanePlanner {
     this.recent = [];
     this.left = 0;
     this.right = 0;
+    this.laneUse = [0, 0, 0, 0];
     this.lastChord = '';
     this.famIdx = -1;
   }
@@ -249,6 +319,7 @@ class LanePlanner {
     this.lastLane = lane;
     this.recent.push(lane);
     if (this.recent.length > 24) this.recent.shift();
+    this.laneUse[lane]++;
     if (lane < 2) this.left++;
     else this.right++;
   }
@@ -267,11 +338,12 @@ class LanePlanner {
   }
 
   /** —— 等间隔连打的三种标准语汇 —— */
-  makeRoll(n) {
-    const dir = this.rng() < 0.5 ? 1 : -1;
-    let start = Math.floor(this.rng() * 4);
-    // 起点别贴着上一个键，避免小节交界处 jack
-    if (start === this.lastLane) start = (start + 2) % 4;
+  makeRoll(n, theme, vary) {
+    // 方向 / 起始键完全由乐句主题决定 —— 不能再因为"上一个音是什么"而改起点，
+    // 否则同一段音乐重复出现时会走成两条不同的线（一致性就没了）。
+    // 交界处的 jack 由调用方那个单点检查处理。
+    const dir = vary ? -theme.dir : theme.dir;
+    const start = theme.start;
     const out = [];
     for (let i = 0; i < n; i++) {
       // 注意 JS 的 % 对负数返回负数，必须再 +4 归一化
@@ -281,33 +353,32 @@ class LanePlanner {
     return out;
   }
 
-  makeTrill(n) {
-    // 六种键对按舒适度加权：跨手最优，1-2（两根食指内收）最少用
-    const pairs = [
-      { p: [0, 3], w: 1.15 },
-      { p: [0, 2], w: 1.1 },
-      { p: [1, 3], w: 1.1 },
-      { p: [1, 2], w: 0.85 },
-      { p: [0, 1], w: 0.95 },
-      { p: [2, 3], w: 0.95 },
-    ];
-    const pair = pairs[weightedPick(pairs.map((x) => x.w), this.rng)].p;
-    // 从离上一个键更远的那根开始，手感更自然
-    let a = pair[0];
-    let b = pair[1];
-    if (Math.abs(this.lastLane - a) < Math.abs(this.lastLane - b)) [a, b] = [b, a];
+  makeTrill(n, theme, vary) {
+    let [a, b] = theme.pair;
+    if (vary) [a, b] = [b, a]; // 后半句反过来，形成"呼应"而不是复制
     const out = [];
     for (let i = 0; i < n; i++) out.push(i % 2 === 0 ? a : b);
     return out;
   }
 
   /**
-   * 排一个小节。
-   * items: [{ t, s }] 已按时间排序；bar 用于决定语汇轮换；eBar 是强度。
+   * 换一个乐句主题。
+   * laneMap 只有"复用的乐句"才有：它是第一次出现时每个音符的
+   * {相对位置, 键位}，复用句按位置查表就能得到几乎相同的配置。
    */
-  planBar(items, bar, eBar, out, barDur, firstBeat) {
+  setTheme(theme, laneMap) {
+    this.theme = theme;
+    this.laneMap = laneMap || null;
+  }
+
+  /**
+   * 排一个小节。
+   * barInPhrase: 0..3，句内位置决定"主题"还是"变体"
+   * theme: 本乐句的主题（roll 方向 / 起始键 / trill 键对）
+   */
+  planBar(items, barInPhrase, eBar, out, barDur, barStart, phraseStart, phraseDur) {
     if (!items.length) return;
-    const { rng, cfg, step } = this;
+    const { rng, cfg, step, theme } = this;
 
     // 节奏型识别：等间隔且够密 → 用连打语汇；否则自由跳
     const gaps = [];
@@ -316,29 +387,63 @@ class LanePlanner {
       gaps.length >= 3 && gaps.every((g) => Math.abs(g - gaps[0]) < 0.15) && gaps[0] >= 0.9;
     const dense = uniform && gaps[0] <= 2.15; // 1/8 或更密
 
-    // 每两小节换一次语汇，四小节一个循环，避免整首一个味道
-    const fam = ((Math.floor(bar / 2) + (uniform ? 1 : 0)) % 2);
+    // 句内前两小节走"主题"，后两小节走"变体"：既一致又不机械
+    const vary = barInPhrase >= 2;
     let seq = null;
-    if (dense && cfg.id !== 'easy') {
-      if (fam === 0) seq = this.makeRoll(items.length);
-      else seq = this.makeTrill(items.length);
+    if (dense && cfg.id !== 'easy' && theme && theme.kind !== 'free') {
+      // trill 只覆盖两根键，连续用会让整段堆在中间两根键上。
+      // 所以让它隔小节出现，其余小节用 roll 把四根键都走到。
+      const useTrill = theme.kind === 'trill' ? barInPhrase % 2 === 1 : barInPhrase % 4 === 3;
+      seq = useTrill
+        ? this.makeTrill(items.length, theme, vary)
+        : this.makeRoll(items.length, theme, vary);
     }
 
     const placed = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
-      const rel = (it.t - (firstBeat + bar * barDur)) / this.beatDur; // 0..4
-      // 整拍 / 半拍都算重音位（反拍重音很常见），越靠整拍越强
+      const rel = (it.t - barStart) / this.beatDur; // 0..4
+      // 整拍 / 半拍都算重音位（反拍重音很常见）
       const isStrong = Math.abs(rel * 2 - Math.round(rel * 2)) < 0.12;
 
-      let lane;
-      if (seq) {
-        lane = seq[i];
-        // 语汇内部也要过一遍手感：万一撞上 jack 就改选
-        if (lane === this.lastLane) lane = this.pick(isStrong);
-      } else {
-        lane = this.pick(isStrong);
+      let lane = -1;
+      if (this.laneMap) {
+        // 复用段落：按「段内第几小节 + 小节内位置」查第一次出现时的键位。
+        // 不能用整段的相对位置 —— 段落长度不一样（8 小节 vs 21 小节），
+        // 归一化后步长不同，永远对不上。
+        const barRel = (barStart - phraseStart) / barDur;
+        const relInBar = (it.t - barStart) / barDur; // 0..1
+        let bestD = Infinity;
+        for (const m of this.laneMap) {
+          const d = Math.abs(m.bar - barRel) * 0.8 + Math.abs(m.rel - relInBar) * 1.6;
+          if (d < bestD) {
+            bestD = d;
+            lane = m.lane;
+          }
+        }
+        if (bestD > 0.3) lane = -1; // 对不上就交回自由选择
+
+        // 照抄也要管手感：查表结果如果让某一手严重过载、或变成"锚点"，
+        // 就交回加权选择。否则一致性会把之前调好的平衡全毁了。
+        if (lane >= 0) {
+          const total = this.left + this.right;
+          if (total > 8) {
+            const ratio = (lane < 2 ? this.left : this.right) / total;
+            if (ratio > 0.62) lane = -1;
+          }
+          const same = this.recent.slice(-8).filter((l) => l === lane).length;
+          if (same >= 3) lane = -1;
+          // 单键过载闸门：照抄会让整段锚在同样的几根键上，
+          // 一旦某键占比超过 29% 就不抄了，交回加权选择把它摊平。
+          if (lane >= 0 && total > 40) {
+            if (this.laneUse[lane] / total > 0.29) lane = -1;
+          }
+        }
       }
+      if (lane < 0 && seq) lane = seq[i];
+      if (lane < 0) lane = this.pick(isStrong);
+      // 语汇内部也要过一遍手感：万一撞上 jack 就改选
+      if (lane === this.lastLane) lane = this.pick(isStrong);
       if (!(lane >= 0 && lane < 4)) lane = this.pick(isStrong); // 兜底，绝不让非法轨道漏出去
 
       placed.push({ t: it.t, lane, s: it.s, tone: it.tone, strong: isStrong });
@@ -428,14 +533,19 @@ export function generateChart(analysis, diff, options = {}) {
   };
 
   const barKeys = [...barCand.keys()].sort((x, y) => x - y);
+  // 先做段落规划：密度和键位都要依赖"哪些乐句是音乐上重复的"
+  const struct = planPhrases(curve, rng);
   const barTarget = new Map();
   const picked = [];
+
+  // 密度：按小节能量插值，句内轻微推进（不盖过音乐本身的起伏）
+  const PHRASE_SHAPE = [0.9, 0.96, 1.02, 1.1];
   for (const b of barKeys) {
     const e = barEnergy(b);
-    const target = Math.max(
-      1,
-      Math.min(cfg.maxPerBar, Math.round((cfg.npsQuiet + (cfg.npsLoud - cfg.npsQuiet) * e) * barDur))
-    );
+    let target = Math.round((cfg.npsQuiet + (cfg.npsLoud - cfg.npsQuiet) * e) * barDur);
+    target = Math.round(target * PHRASE_SHAPE[((b % 4) + 4) % 4]);
+    if (e < 0.16) target = Math.min(target, 2); // 极安静就留白
+    target = Math.max(1, Math.min(cfg.maxPerBar, target));
     barTarget.set(b, target);
     const list = barCand.get(b).slice().sort((p, q) => q.score - p.score);
     let taken = 0;
@@ -484,7 +594,8 @@ export function generateChart(analysis, diff, options = {}) {
       for (const sl of slots) {
         if (have >= target) break;
         if (sl.s < minS) break;
-        if (rng() < 0.1) continue;
+        // 这里不再随机跳过：同一段音乐重复出现时，音符数必须一样，
+        // 否则 pattern 再怎么复用也对不上（这是"一致性"的前提）
         added.push({ t: sl.t, s: sl.s, tone: 'hat', pos: null });
         have++;
       }
@@ -493,7 +604,7 @@ export function generateChart(analysis, diff, options = {}) {
     timeline.sort((a, b) => a.t - b.t);
   }
 
-  // ---- 4. 键位编排：按小节识别节奏型，套用语汇 ----
+  // ---- 4. 键位编排：按乐句主题套语汇 ----
   const planner = new LanePlanner(rng, cfg, step, beatDur);
   const notes = [];
   const byBar = new Map();
@@ -502,8 +613,46 @@ export function generateChart(analysis, diff, options = {}) {
     if (!byBar.has(b)) byBar.set(b, []);
     byBar.get(b).push(n);
   }
-  for (const b of [...byBar.keys()].sort((x, y) => x - y)) {
-    planner.planBar(byBar.get(b), b, barEnergy(b), notes, barDur, firstBeat);
+  const allBars = [...byBar.keys()].sort((x, y) => x - y);
+  const barSet = new Set(allBars);
+  // 每个档位只保留第一段的键位表，后续同档位的段落照着它排 ——
+  // 这就是"副歌不管出现几次，配置都是同一套"的实现方式。
+  const tierLaneMaps = new Map();
+
+  for (const sg of struct.segs) {
+    const laneMap = sg.tier > 0 ? tierLaneMaps.get(sg.tier) : null;
+    const segStart = firstBeat + sg.start * barDur;
+    const segDur = sg.len * barDur;
+    const startIdx = notes.length;
+    planner.setTheme(sg.theme, laneMap);
+
+    for (let k = 0; k < sg.len; k++) {
+      const b = sg.start + k;
+      if (!barSet.has(b)) continue;
+      planner.planBar(
+        byBar.get(b),
+        k * 2 >= sg.len ? 2 : 0, // 段内后半走变体，避免整段一模一样
+        barEnergy(b),
+        notes,
+        barDur,
+        firstBeat + b * barDur,
+        segStart,
+        segDur
+      );
+    }
+
+    if (sg.tier > 0 && !laneMap && notes.length > startIdx) {
+      const map = [];
+      for (let i = startIdx; i < notes.length; i++) {
+        const barIdx = (notes[i].t - segStart) / barDur;
+        map.push({
+          bar: barIdx,
+          rel: barIdx - Math.floor(barIdx), // 小节内 0..1
+          lane: notes[i].lane,
+        });
+      }
+      tierLaneMaps.set(sg.tier, map);
+    }
   }
 
   notes.sort((a, b) => a.t - b.t || a.lane - b.lane);
@@ -595,6 +744,8 @@ export function generateChart(analysis, diff, options = {}) {
     totalWeight,
     duration,
     seed: hashString(`${cfg.id}:${Math.round(analysis.bpm * 10)}`),
+    // 结构信息（诊断用）：乐句数、其中多少句复用了别的乐句的主题
+    structure: { segments: struct.segs.map((x) => ({ tier: x.tier, start: x.start, len: x.len })) },
     ...options,
   };
 }
