@@ -1,4 +1,5 @@
 import { mulberry32 } from './fft.js';
+import { PRIORS, CHORD_SLOT_WEIGHT } from './chart-priors.js';
 
 /**
  * 谱面生成器
@@ -51,11 +52,12 @@ export const DIFFICULTIES = [
     gridDiv: 4,
     fillDiv: 2,
     minGap: 0.135,
-    npsQuiet: 2.4,
-    npsLoud: 6.2,
+    npsQuiet: 1.9,
+    npsLoud: 4.6,
     maxPerBar: 11,
     allowChord: true,
-    chordChance: 0.08,
+    // 目标双押率（按位置权重缩放后约等于"音群中双押以上的比例"）
+    chordBase: 0.20,
     allowFill: true,
     fillRate: 0.3,
     holdChance: 0.1,
@@ -75,14 +77,14 @@ export const DIFFICULTIES = [
     name: 'HARD',
     tag: '狂暴',
     color: '#f472b6',
-    gridDiv: 8,
+    gridDiv: 4,
     fillDiv: 4,
     minGap: 0.082,
-    npsQuiet: 4.4,
-    npsLoud: 9.9,
+    npsQuiet: 3.2,
+    npsLoud: 7.0,
     maxPerBar: 20,
     allowChord: true,
-    chordChance: 0.22,
+    chordBase: 0.42,
     allowFill: true,
     fillRate: 0.7,
     holdChance: 0.05,
@@ -619,11 +621,24 @@ class LanePlanner {
       this.commit(lane);
     }
 
-    // 双押：只在强拍 + 足够炸的段落出现
-    if (cfg.allowChord && eBar > 0.6) {
-      const p = Math.min(0.5, (eBar - 0.6) * 1.8 * (cfg.chordChance + 0.16));
+    // 双押：位置由**真实谱面统计**决定。
+    // 蒸馏结果：双押以上占 40%；其中 49% 落在正拍、28% 半拍、10% 在 3/4 拍。
+    // 也就是说重音该压在正拍和半拍上 —— 按这个权重撒，才会有"顿"的感觉；
+    // 均匀撒满或者只在强拍撒一点，都会显得平。
+    if (cfg.allowChord && eBar > 0.32) {
+      const base = cfg.chordBase * (0.35 + 1.15 * eBar);
+      const cm = this.chordMask;
       for (const n of placed) {
-        if (!n.strong) continue;
+        const relBeat = (n.t - barStart) / this.beatDur; // 0..4
+        const slot = ((Math.round((relBeat % 1) * 16) % 16) + 16) % 16;
+        // 动机槽位上的音按权重加成；不在动机上的只有很小的机会，
+        // 这样"重音位置"每小节都是一样的，玩家能跟着点头。
+        // 动机槽位上的双押接近"确定"（0.9），其余位置几乎不出（0.06）：
+        // 这样重音图案在短语内是重复的，玩家能跟着点头；随机撒就没有重音感。
+        // 没有动机的小节（只靠补音撑起来的）不能当成"全是重音位"，
+        // 否则会把整小节塞满双押。兜底只认 0 / 8 两个正拍。
+        const onMotif = cm ? !!cm[slot] : slot % 8 === 0;
+        const p = onMotif ? 0.92 : 0.02;
         if (rng() > p) continue;
         const partner = this.partnerOf(n.lane);
         if (placed.some((m) => Math.abs(m.t - n.t) < 0.02 && m.lane === partner)) continue;
@@ -719,6 +734,8 @@ export function generateChart(analysis, diff, options = {}) {
   const picked = [];
 
   // 密度：按小节能量插值，句内轻微推进（不盖过音乐本身的起伏）
+  // 注意这里只算目标，**先不选音** —— 选音要等动机（barMask）生成之后，
+  // 否则动机只能影响补音，主音符仍是一盘散沙。
   const PHRASE_SHAPE = [0.9, 0.96, 1.02, 1.1];
   for (const b of barKeys) {
     const e = barEnergy(b);
@@ -727,20 +744,116 @@ export function generateChart(analysis, diff, options = {}) {
     if (e < 0.16) target = Math.min(target, 2); // 极安静就留白
     target = Math.max(1, Math.min(cfg.maxPerBar, target));
     barTarget.set(b, target);
-    const list = barCand.get(b).slice().sort((p, q) => q.score - p.score);
-    let taken = 0;
-    for (const ev of list) {
-      if (taken >= target) break;
-      let ok = true;
-      for (let i = 0; i < picked.length; i++) {
-        if (Math.abs(picked[i].t - ev.t) < cfg.minGap) {
-          ok = false;
-          break;
-        }
+  }
+
+  // ---- 3.4 节奏动机 ----
+  // 蒸馏结果：真实谱面里 39% 的相邻小节节奏型**完全一致**。
+  // 而"每小节按能量重新填满"会让每个小节的节奏型都不一样，听起来像机器在数拍。
+  //
+  // 做法：四小节一个短语，抽一条 16 分槽位的节奏型（按真实位置频率加权），
+  // 短语内复用它，最后一小节翻转两个槽位做变化。这样既有记忆点又不呆板。
+  const barMask = new Map();
+  // 双押也要有动机：真实谱面里重音是"每小节同一位置都加重"，
+  // 而不是每小节随机挑几个音加倍 —— 后者听起来就是噪音。
+  const barChordMask = new Map();
+  {
+    const P = 4;
+    const barLo = Math.min(...barKeys);
+    const barHi = Math.max(...barKeys);
+    for (let s0 = barLo; s0 <= barHi; s0 += P) {
+      const group = [];
+      for (let k = 0; k < P; k++) if (barTarget.has(s0 + k)) group.push(s0 + k);
+      if (!group.length) continue;
+
+      // 关键：节奏型不是随机抽的，而是**从音频里取短语共识** ——
+      // 把 4 个小节对应槽位的击打强度平均，最强的那几格就是这个短语的节奏骨架。
+      // 这样动机既贴合音乐，又天然在短语内重复（音乐本身就是重复的）。
+      const slotStrength = new Float32Array(16);
+      for (let i = 0; i < 16; i++) {
+        let sum = 0;
+        for (const b of group) sum += strengthAt(firstBeat + b * barDur + (i / 16) * barDur);
+        slotStrength[i] = sum / group.length;
       }
-      if (ok) {
-        picked.push(ev);
-        taken++;
+      const order = [...Array(16).keys()].sort(
+        (x, y) =>
+          slotStrength[y] * (0.7 + PRIORS.phase[y]) - slotStrength[x] * (0.7 + PRIORS.phase[x])
+      );
+
+      const peak = Math.max(...group.map((b) => barTarget.get(b) || 0));
+      // 目标数的是"音符"，双押会被算两次；这里换算成"音群数"再定槽位数，
+      // 否则一条 16 格的节奏骨架上会被塞进远超骨架的音符，动机就没了。
+      const groups = Math.round(peak / (1 + 0.5 * (cfg.allowChord ? cfg.chordBase : 0)));
+      const K = Math.max(3, Math.min(16, groups));
+      const mask = new Uint8Array(16);
+      for (let c = 0; c < K; c++) mask[order[c]] = 1;
+
+      // 双押槽位：**必须从音符骨架里挑**，否则会出现"有音就双押"。
+      // 取骨架的 1/3 左右作为重音位，优先正拍/半拍（真实重音的 77% 在这两处）。
+      const maskSlots = [];
+      for (let i = 0; i < 16; i++) if (mask[i]) maskSlots.push(i);
+      const chordOrder = maskSlots.slice().sort(
+        (x, y) =>
+          slotStrength[y] * CHORD_SLOT_WEIGHT[y] - slotStrength[x] * CHORD_SLOT_WEIGHT[x]
+      );
+      const k2 = Math.max(1, Math.min(4, Math.round(maskSlots.length * 0.18)));
+      const chordMask = new Uint8Array(16);
+      for (let c = 0; c < k2 && c < chordOrder.length; c++) chordMask[chordOrder[c]] = 1;
+
+      group.forEach((b, k) => {
+        if (k === group.length - 1 && group.length > 2) {
+          // 末小节：翻转两个槽位，做"变奏收尾"
+          const m2 = Uint8Array.from(mask);
+          for (let f = 0; f < 2; f++) {
+            const i = Math.floor(rng() * 16);
+            m2[i] = m2[i] ? 0 : 1;
+          }
+          barMask.set(b, m2);
+          barChordMask.set(b, chordMask);
+        } else {
+          barMask.set(b, mask);
+          barChordMask.set(b, chordMask);
+        }
+      });
+    }
+  }
+
+  // ---- 3.5 选音：按"强度 + 动机槽位"排序，而不是只看强度 ----
+  // 真实谱面是先有节奏型再挑声音；只看强度的话，音符会均匀铺满每一格。
+  for (const b of barKeys) {
+    const target = barTarget.get(b) || 1;
+    const t0 = firstBeat + b * barDur;
+    const mask = barMask.get(b);
+    const list = barCand
+      .get(b)
+      .map((ev) => {
+        const slot = Math.min(15, Math.max(0, Math.round(((ev.t - t0) / barDur) * 16) % 16));
+        return { ev, slot, onMask: !!(mask && mask[slot]), score: ev.score };
+      })
+      .sort((p, q) => q.score - p.score);
+    let maskCount = 0;
+    if (mask) for (let i = 0; i < 16; i++) maskCount += mask[i];
+    let taken = 0;
+    const take = (cand) => {
+      const ev = cand.ev;
+      for (let i = picked.length - 1; i >= 0 && picked.length - i <= 6; i--) {
+        if (Math.abs(picked[i].t - ev.t) < cfg.minGap) return false;
+      }
+      picked.push(ev);
+      taken++;
+      return true;
+    };
+    // 骨架就是节奏：把骨架上的音**全部**收下（不再按 target 截断），
+    // 这样每一小节的节奏型一致，玩家才能跟着点头。
+    // target 只用来决定骨架有几格，不再直接决定音符数。
+    for (const cand of list) {
+      if (!cand.onMask) continue;
+      take(cand);
+    }
+    // 骨架在这几格完全没声音（很少见）时兜底，防止整小节空白
+    if (taken === 0) {
+      for (const cand of list) {
+        if (taken >= Math.min(target, 4)) break;
+        take(cand);
       }
     }
   }
@@ -758,35 +871,27 @@ export function generateChart(analysis, diff, options = {}) {
   }));
   const hasAt = (arr, t, tol) => arr.some((n) => Math.abs(n.t - t) < tol);
   if (cfg.allowFill) {
-    const fstep = beatDur / cfg.fillDiv;
     const added = [];
     for (const bar of barKeys) {
       const t0 = firstBeat + bar * barDur;
-      const eBar = barEnergy(bar);
-      const target = barTarget.get(bar) || 4;
-      let have = timeline.filter((n) => n.t >= t0 - 0.01 && n.t < t0 + barDur - 0.01).length;
-      if (have >= target || eBar < 0.34) continue;
-
+      const mask = barMask.get(bar);
+      if (!mask) continue;
       const slots = [];
-      for (let k = 0; k < 4 * cfg.fillDiv; k++) {
-        const t = t0 + k * fstep;
+      for (let i = 0; i < 16; i++) {
+        if (!mask[i]) continue;
+        const t = t0 + (i / 16) * barDur;
         if (t >= t0 + barDur - 0.02) break;
-        if (hasAt(timeline, t, fstep * 0.45) || hasAt(added, t, fstep * 0.45)) continue;
-        // 补音优先补"本来就有声音"的位置，别凭空插
+        const tol = (barDur / 16) * 0.35;
+        if (hasAt(timeline, t, tol) || hasAt(added, t, tol)) continue;
+        // 骨架上的格子只要"有一点声音"就补上 —— 谱师写谱也是这么做的：
+        // 踩镲很轻也要写，因为节奏骨架比响度更重要。
         const s = strengthAt(t);
-        if (s < 0.07) continue;
-        slots.push({ t, s, beatInBar: k / cfg.fillDiv });
+        if (s < 0.035) continue;
+        slots.push({ t, s });
       }
+      // 骨架就是密度的上限：不再额外往骨架外撒音
       slots.sort((p, q) => q.s - p.s);
-      const minS = eBar > 0.7 ? 0.09 : 0.18;
-      for (const sl of slots) {
-        if (have >= target) break;
-        if (sl.s < minS) break;
-        // 这里不再随机跳过：同一段音乐重复出现时，音符数必须一样，
-        // 否则 pattern 再怎么复用也对不上（这是"一致性"的前提）
-        added.push({ t: sl.t, s: sl.s, tone: 'hat', pos: null });
-        have++;
-      }
+      for (const sl of slots) added.push({ t: sl.t, s: sl.s, tone: 'hat', pos: null });
     }
     timeline.push(...added);
     timeline.sort((a, b) => a.t - b.t);
@@ -922,6 +1027,7 @@ export function generateChart(analysis, diff, options = {}) {
     for (let k = 0; k < sg.len; k++) {
       const b = sg.start + k;
       if (!barSet.has(b)) continue;
+      planner.chordMask = barChordMask.get(b) || null;
       planner.planBar(
         byBar.get(b),
         k * 2 >= sg.len ? 2 : 0, // 段内后半走变体，避免整段一模一样

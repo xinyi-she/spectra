@@ -22,3 +22,9 @@ desktop.ini
 # 仓库内附带的无版权示例曲（CC0，可随代码分发）
 !assets/demo/spectra-demo.mp3
 !assets/demo/spectra-demo.jpg
+
+# 蒸馏用的第三方谱面（只做统计，不入库）
+tools/_charts/
+tools/_osz/
+tools/_priors.json
+tools/_picked.json
