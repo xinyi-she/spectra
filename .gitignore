@@ -28,3 +28,6 @@ tools/_charts/
 tools/_osz/
 tools/_priors.json
 tools/_picked.json
+tools/_hold_priors.json
+tools/_gen_charts.json
+tools/compare_report.md

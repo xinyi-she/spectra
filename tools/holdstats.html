@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>谱面度量 · 长条</title>
+<style>
+  body { background: #0d1117; color: #c9d1d9; font: 13px/1.6 ui-monospace, Consolas, monospace; padding: 24px; }
+  h1 { font-size: 15px; color: #e6edf3; }
+  table { border-collapse: collapse; margin-top: 12px; }
+  th, td { padding: 4px 10px; text-align: right; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 500; }
+  td:first-child, th:first-child { text-align: left; }
+  .bar { color: #8b949e; }
+</style>
+</head>
+<body>
+<h1>谱面度量 · 长条（自动谱面侧）</h1>
+<div id="out" class="bar">分析中…</div>
+<table id="tbl"></table>
+<script type="module">
+import { analyzeAudio } from '../js/analyzer.js';
+import { generateAll } from '../js/chart.js';
+import { holdMetrics } from '../js/metrics.js';
+
+const params = new URLSearchParams(location.search);
+const song = params.get('song') || 'spectra-demo.mp3';
+const out = document.getElementById('out');
+
+function pct(v) { return (v * 100).toFixed(1) + '%'; }
+
+try {
+  const buf = await (await fetch('../assets/demo/' + song)).arrayBuffer();
+  const ctx = new OfflineAudioContext(1, 1024, 48000);
+  const audio = await ctx.decodeAudioData(buf);
+  const ch = [];
+  for (let i = 0; i < audio.numberOfChannels; i++) ch.push(audio.getChannelData(i));
+  const t0 = performance.now();
+  const a = analyzeAudio(ch, audio.sampleRate);
+  const ms = Math.round(performance.now() - t0);
+  const charts = generateAll(a);
+
+  out.textContent = `${song}  ${a.bpm.toFixed(1)} BPM  ${a.duration.toFixed(0)}s  分析 ${ms}ms`;
+  const rows = [];
+  const cols = ['谱面', '音符', '长条', '占比', 'lenP10', 'lenP50', 'lenP90', '链', '最长链', '紧接', '尾离网', '小节p50', '小节p90', '连小节', '重叠'];
+  rows.push(cols);
+  for (const c of charts) {
+    const m = holdMetrics(c.notes.map((n) => ({ t: n.t, lane: n.lane, type: n.type, dur: n.dur })), a.beatDur);
+    rows.push([
+      `${c.name} Lv${c.level}`, m.notes, m.holds, pct(m.holdShare),
+      m.lenP10.toFixed(2), m.lenP50.toFixed(2), m.lenP90.toFixed(2),
+      pct(m.chainShare), m.maxChain, pct(m.tailTight), pct(m.tailOffGrid),
+      m.perBarP50, m.perBarP90, m.maxBars, m.overlap,
+    ]);
+  }
+  const tbl = document.getElementById('tbl');
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    for (const cell of r) {
+      const el = document.createElement(r === rows[0] ? 'th' : 'td');
+      el.textContent = cell;
+      tr.appendChild(el);
+    }
+    tbl.appendChild(tr);
+  }
+  // 也给控制台一份，方便 cdp 抓
+  console.log('HOLDSTATS ' + JSON.stringify({ song, bpm: a.bpm, charts: charts.map((c) => ({ name: c.name, hold: c.holdStats, ...holdMetrics(c.notes.map((n) => ({ t: n.t, lane: n.lane, type: n.type, dur: n.dur })), a.beatDur, c.beatOffset) })) }));
+
+  // ?dump=1：把音符全量吐出来，供 tools/compare_human.mjs 复用
+  if (params.get('dump')) {
+    console.log('CHARTDUMP ' + JSON.stringify({
+      song,
+      bpm: a.bpm,
+      beatDur: a.beatDur,
+      charts: charts.map((c) => ({
+        name: c.name,
+        level: c.level,
+        beatOffset: c.beatOffset,
+        notes: c.notes.map((n) => ({ t: +n.t.toFixed(4), lane: n.lane, type: n.type, dur: n.dur ? +n.dur.toFixed(4) : 0 })),
+      })),
+    }));
+  }
+  window.__done = true;
+} catch (e) {
+  out.textContent = 'ERROR ' + e.message;
+  console.log('HOLDSTATS ERROR ' + e.stack);
+}
+</script>
+</body>
+</html>

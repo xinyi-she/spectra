@@ -30,7 +30,24 @@ export const DIFFICULTIES = [
     allowChord: false,
     allowFill: true,
     fillRate: 0.45,
-    holdChance: 0.16,
+    /**
+     * 长条策略（详见 placeHolds 的注释）。
+     * 实测 osu!mania 4K 混合谱：长条占 6.5%、尾巴到同轨下一个音 p50 0.75 拍。
+     * 但那是"松手只扣分"的规则；本作松手早算 MISS，所以长条要**更长、更疏**，
+     * 密度可以贴近人类，间隔必须比人类宽。
+     */
+    hold: {
+      share: 0.05,        // 目标占比
+      minBeats: 1.5,      // 最短 1.5 拍 —— 短于这个读起来像"卡了一下"
+      maxBeats: 4,
+      breathBeats: 1.0,   // 尾巴后同轨至少留 1 拍（人类 p50 是 0.75）
+      headGapBeats: 3,    // 两个长条头至少隔 3 拍
+      perBar: 1,
+      phraseBars: 3,      // 一次最多连写 3 小节（人类是"成段"出现）
+      coverage: 0.45,     // 全曲最多多少比例的小节带长条
+      handPerBeat: 2.0,   // 长条期间同一只手每拍最多再打 2 个音
+      sustain: 0.35,
+    },
     specialChance: 0.02,
     maxNps: 3.6,
     levelBase: 1,
@@ -60,7 +77,18 @@ export const DIFFICULTIES = [
     chordBase: 0.17,
     allowFill: true,
     fillRate: 0.3,
-    holdChance: 0.1,
+    hold: {
+      share: 0.055,
+      minBeats: 1.5,
+      maxBeats: 4,
+      breathBeats: 0.85,
+      headGapBeats: 2.5,
+      perBar: 1,
+      phraseBars: 4,
+      coverage: 0.5,
+      handPerBeat: 2.8,
+      sustain: 0.35,
+    },
     specialChance: 0.05,
     maxNps: 6.2,
     levelBase: 4.5,
@@ -87,7 +115,18 @@ export const DIFFICULTIES = [
     chordBase: 0.33,
     allowFill: true,
     fillRate: 0.7,
-    holdChance: 0.05,
+    hold: {
+      share: 0.06,
+      minBeats: 1.0,
+      maxBeats: 3,
+      breathBeats: 0.75,
+      headGapBeats: 2,
+      perBar: 1,
+      phraseBars: 4,
+      coverage: 0.55,
+      handPerBeat: 4.2,
+      sustain: 0.32,
+    },
     specialChance: 0.07,
     maxNps: 11.8,
     levelBase: 8,
@@ -655,6 +694,211 @@ class LanePlanner {
   }
 }
 
+/**
+ * 长条（LN）编排
+ * ==================================================================
+ * 之前是「按概率把单点随机变成长条」，三条约束都没有，结果就是
+ * 连续长条 + 松手即按，打起来很反人类。这里换成人类写谱的结构：
+ *
+ *   1. **只写在"接得住"的位置**：同轨后面必须留出 breath 拍空白。
+ *      人类谱面尾巴到同轨下一个音 p50 = 0.75 拍，我们取 0.85~1.0。
+ *   2. **长度由声音决定**：沿着 RMS 包络往下走，声音塌下去（<45% 峰值）
+ *      就是长条的天然终点，再吸附到 1/2 拍网格。人类尾巴 90% 以上都在网格上。
+ *   3. **成段出现，不成串**：人类谱面的长条是"某几小节有、然后一段没有"
+ *      （实测只有 30% 的小节含长条，但一旦出现会连着 2~4 小节）。
+ *      所以这里先按小节挑出最好的候选，再把相邻小节连成"长条短语"。
+ *   4. **留呼吸**：两个长条头至少隔 headGapBeats 拍；长条期间同一只手
+ *      还要打的音有上限（EASY 每拍 2 个），否则一只手既按又打，必炸。
+ *
+ * 实测数据（osu!mania 4K，132 张谱 / 369k 音符，mixed 类 56 张）：
+ *   长条占 6.5%、长度 p50 1.0 拍、尾巴后同轨间隔 p50 0.75 拍、
+ *   头部间隔 <2 拍占 76%（这条我们**故意不学** —— 见下）。
+ *
+ * 为什么偏偏不学"密集连续长条"：osu 的长条松手早了只是扣分，仍算过；
+ * 本作松手早于尾巴 0.3 拍直接 MISS。同一条谱，规则一换，手感就是两回事。
+ * 所以密度跟着人类走，间隔比人类更宽。
+ */
+function sustainSpan(analysis, t, maxLen, minLen) {
+  const fd = analysis.frameDur || 0.01;
+  const step = Math.max(0.02, fd * 2);
+  const e0 = analysis.energyAt(t + 0.05);
+  if (!(e0 > 0.06)) return null; // 几乎没有声音，长条没有依据
+
+  let end = maxLen;
+  let minRatio = 1;
+  for (let x = step; x < maxLen; x += step) {
+    const r = analysis.energyAt(t + x) / e0;
+    if (r < minRatio) minRatio = r;
+    if (r < 0.45) {
+      end = x; // 声音塌了 —— 这里就是天然的尾巴
+      break;
+    }
+  }
+  // 尾巴吸附到 1/2 拍网格（向下取，避免压到下一句）
+  const half = (analysis.beatDur || 0.5) / 2;
+  end = Math.floor(end / half) * half;
+  if (end < minLen) return null;
+
+  // 中途的重击会打断"延续感"：每来一次强重击，可信度打折
+  let strong = 0;
+  if (analysis.onsets) {
+    for (const o of analysis.onsets) {
+      if (o.t <= t + 0.04) continue;
+      if (o.t >= t + end - 0.03) break;
+      if (o.s > 0.55) strong++;
+    }
+  }
+  const q = Math.max(0, minRatio) * Math.max(0.35, 1 - strong * 0.1);
+  return { len: end, q };
+}
+
+function placeHolds(notes, analysis, cfg, beatDur, stats = null) {
+  const H = cfg.hold;
+  if (!H) return notes;
+
+  const firstBeat = analysis.firstBeat || 0;
+  const barDur = beatDur * 4;
+  const barOf = (t) => Math.floor((t - firstBeat) / barDur);
+  const minLen = H.minBeats * beatDur;
+  const breath = H.breathBeats * beatDur;
+  const budget = Math.max(1, Math.round(notes.length * H.share));
+
+  // 同轨索引
+  const byLane = [[], [], [], []];
+  for (const n of notes) byLane[n.lane].push(n);
+  for (const a of byLane) a.sort((x, y) => x.t - y.t);
+
+  // ---- 1. 候选：结构上接得住 + 声音在延续 ----
+  const cands = [];
+  const rej = { room: 0, quiet: 0, sustain: 0 };
+  for (const n of notes) {
+    if (n.type !== 'tap') continue;
+    const lane = byLane[n.lane];
+    const next = lane[lane.indexOf(n) + 1];
+    const stop = next ? next.t : n.t + (H.maxBeats + H.breathBeats) * beatDur;
+    const room = stop - n.t - breath;
+    if (room < minLen) {
+      rej.room++;
+      continue;
+    }
+    const span = sustainSpan(analysis, n.t, Math.min(room, H.maxBeats * beatDur), minLen);
+    if (!span) {
+      rej.quiet++;
+      continue;
+    }
+    if (span.q < H.sustain) {
+      rej.sustain++;
+      continue;
+    }
+
+    // 正拍上的长条更好读，给一点点加成
+    const beats = (n.t - firstBeat) / beatDur;
+    const onBeat = Math.abs(beats - Math.round(beats)) < 0.06;
+    // 弱音上开长条没有说服力
+    const strength = Math.min(1, (n.s || 0.5) * 1.6);
+    cands.push({ n, len: span.len, q: span.q * (0.7 + 0.3 * strength) * (onBeat ? 1.15 : 1) });
+  }
+  if (stats) Object.assign(stats, rej, { cands: cands.length, budget });
+  if (!cands.length) return notes;
+
+  // ---- 2. 每小节留一个最好的候选，再把相邻小节连成短语 ----
+  const barBest = new Map();
+  for (const c of cands) {
+    const b = barOf(c.n.t);
+    const cur = barBest.get(b);
+    if (!cur || c.q > cur.q) barBest.set(b, c);
+  }
+  const barList = [...barBest.keys()].sort((a, b) => a - b);
+  const phrases = [];
+  let run = [];
+  for (const b of barList) {
+    if (run.length && b === run[run.length - 1] + 1) run.push(b);
+    else {
+      if (run.length) phrases.push(run);
+      run = [b];
+    }
+  }
+  if (run.length) phrases.push(run);
+  // 长短语优先；短片段也不至于被丢光
+  const phraseScore = (ph) => ph.reduce((s, b) => s + barBest.get(b).q, 0) / Math.sqrt(ph.length);
+  phrases.sort((a, b) => phraseScore(b) - phraseScore(a));
+
+  // 先把短语按分数挑出来，再**按时间顺序**落地。
+  // （先挑后排是必要的：间距检查依赖"上一个长条"的位置，
+  //   如果按分数乱序落地，时间会来回跳，间距判断全错。）
+  const barCount = Math.max(1, Math.round((notes[notes.length - 1].t - notes[0].t) / barDur));
+  const maxBars = Math.round(barCount * (H.coverage || 0.5));
+  const picked = [];
+  let barsPlanned = 0;
+  for (const ph of phrases) {
+    if (barsPlanned >= maxBars) break;
+    const take = Math.min(ph.length, H.phraseBars);
+    if (barsPlanned + take > maxBars && picked.length) continue;
+    picked.push({ ph, take, start: Math.floor((ph.length - take) / 2) });
+    barsPlanned += take;
+  }
+  picked.sort((a, b) => a.ph[a.start] - b.ph[b.start]);
+
+  // ---- 3. 按时间顺序放置，带间隔 / 同手负荷检查 ----
+  const chosen = new Map(); // note -> {len}
+  const laneFreeAt = [0, 0, 0, 0];
+  // 同一只手也要留呼吸：上一根长条刚松手，紧接着同一只手又开一根，
+  // 手指要先抬再按，EASY 难度下这就是"反人类"的来源。
+  const handFreeAt = [0, 0];
+  let lastHead = -1e9;
+  const drop = { gap: 0, lane: 0, hand: 0 };
+  const handBusy = (lane, t, len) => {
+    const left = lane < 2;
+    let busy = 0;
+    for (const m of notes) {
+      if (m.t <= t + 0.03 || m.t >= t + len - 0.03) continue;
+      if ((m.lane < 2) === left) busy++;
+    }
+    return busy;
+  };
+
+  for (const { ph, take, start } of picked) {
+    if (chosen.size >= budget) break;
+    for (let i = start; i < start + take; i++) {
+      if (chosen.size >= budget) break;
+      const c = barBest.get(ph[i]);
+      const t = c.n.t;
+      if (t - lastHead < H.headGapBeats * beatDur) {
+        drop.gap++;
+        continue;
+      }
+      if (t < laneFreeAt[c.n.lane]) {
+        drop.lane++;
+        continue;
+      }
+      const hand = c.n.lane < 2 ? 0 : 1;
+      if (t < handFreeAt[hand]) {
+        drop.hand++;
+        continue;
+      }
+      if (handBusy(c.n.lane, t, c.len) > H.handPerBeat * (c.len / beatDur) + 1) {
+        drop.hand++;
+        continue;
+      }
+      chosen.set(c.n, c.len);
+      laneFreeAt[c.n.lane] = t + c.len + breath;
+      handFreeAt[hand] = t + c.len + breath;
+      lastHead = t;
+    }
+  }
+  if (stats) Object.assign(stats, drop, { chosen: chosen.size, phrases: phrases.length });
+  if (!chosen.size) return notes;
+
+  // ---- 4. 落盘：被长条盖住的同轨音直接删掉（不留"按住还要再按"） ----
+  const holds = notes.filter((n) => chosen.has(n)).map((n) => ({ t: n.t, lane: n.lane, end: n.t + chosen.get(n) }));
+  return notes
+    .filter((n) => {
+      if (chosen.has(n)) return true;
+      return !holds.some((h) => h.lane === n.lane && n.t > h.t + 0.02 && n.t < h.end - 0.02);
+    })
+    .map((n) => (chosen.has(n) ? { ...n, type: 'hold', dur: chosen.get(n) } : n));
+}
+
 export function generateChart(analysis, diff, options = {}) {
   const cfg = typeof diff === 'string' ? DIFFICULTIES.find((d) => d.id === diff) : diff;
   const { beatDur, firstBeat, duration } = analysis;
@@ -786,6 +1030,10 @@ export function generateChart(analysis, diff, options = {}) {
       const K = Math.max(3, Math.min(16, groups));
       const mask = new Uint8Array(16);
       for (let c = 0; c < K; c++) mask[order[c]] = 1;
+      // 正拍必须踩：人类谱面 96% 的小节都在正拍上放了音（实测 165 张 4K 谱）。
+      // 骨架按平均强度挑格子，偶尔会把正拍漏掉 —— 那一小节就"不在点上"了。
+      const peakSlot = Math.max(...slotStrength);
+      if (peakSlot > 0 && slotStrength[0] >= peakSlot * 0.4) mask[0] = 1;
 
       // 双押槽位：**必须从音符骨架里挑**，否则会出现"有音就双押"。
       // 取骨架的 1/3 左右作为重音位，优先正拍/半拍（真实重音的 77% 在这两处）。
@@ -819,6 +1067,22 @@ export function generateChart(analysis, diff, options = {}) {
 
   // ---- 3.5 选音：按"强度 + 动机槽位"排序，而不是只看强度 ----
   // 真实谱面是先有节奏型再挑声音；只看强度的话，音符会均匀铺满每一格。
+  //
+  // 另外一件事：**正拍优先**。take() 有最小间距限制，上一小节末尾的音
+  // 会把下一小节正拍挤掉，结果有些小节根本不踩正拍（实测 EASY 只有 71%，
+  // 人类是 96%）。所以先把"下一小节正拍有声音"的小节记下来，
+  // 挑音时避让它。
+  const barDownbeat = new Map();
+  for (const b of barKeys) {
+    const t0 = firstBeat + b * barDur;
+    let best = null;
+    for (const ev of barCand.get(b)) {
+      const d = Math.abs(ev.t - t0);
+      if (d <= barDur / 16 && (!best || d < Math.abs(best.t - t0))) best = ev;
+    }
+    if (best) barDownbeat.set(b, best.t);
+  }
+
   for (const b of barKeys) {
     const target = barTarget.get(b) || 1;
     const t0 = firstBeat + b * barDur;
@@ -833,8 +1097,11 @@ export function generateChart(analysis, diff, options = {}) {
     let maskCount = 0;
     if (mask) for (let i = 0; i < 16; i++) maskCount += mask[i];
     let taken = 0;
+    const nextDown = barDownbeat.get(b + 1);
     const take = (cand) => {
       const ev = cand.ev;
+      // 给下一小节的正拍让路
+      if (nextDown !== undefined && ev.t < nextDown - 1e-6 && nextDown - ev.t < cfg.minGap) return false;
       for (let i = picked.length - 1; i >= 0 && picked.length - i <= 6; i--) {
         if (Math.abs(picked[i].t - ev.t) < cfg.minGap) return false;
       }
@@ -855,6 +1122,12 @@ export function generateChart(analysis, diff, options = {}) {
         if (taken >= Math.min(target, 4)) break;
         take(cand);
       }
+    }
+    // 正拍兜底：这一小节还没有音落在正拍上，就把最近的候选补上去
+    const down = barDownbeat.get(b);
+    if (down !== undefined && !picked.some((ev) => Math.abs(ev.t - t0) < barDur / 32)) {
+      const cand = list.find((c) => c.ev.t === down);
+      if (cand) take(cand);
     }
   }
   picked.sort((a, b) => a.t - b.t);
@@ -1093,33 +1366,9 @@ export function generateChart(analysis, diff, options = {}) {
     limited.push(n);
   }
 
-  // ---- 6. 长条：留给"有空隙的强拍"，别跟连打抢位置 ----
-  const withHolds = [];
-  const sorted = limited.slice().sort((a, b) => a.t - b.t);
-  for (let i = 0; i < sorted.length; i++) {
-    const n = sorted[i];
-    const prev = sorted[i - 1];
-    const prevSame = prev && prev.lane === n.lane && n.t - prev.t < beatDur * 1.2;
-    if (n.type !== 'tap' || prevSame || rng() > cfg.holdChance * 1.1) {
-      withHolds.push(n);
-      continue;
-    }
-    // 长条可以跨过别的轨道的音，只要本轨道后面没有更近的音
-    const nextSame = sorted.slice(i + 1).find((m) => m.lane === n.lane);
-    const limit = nextSame ? nextSame.t - beatDur * 0.28 : n.t + beatDur * 3;
-    const dur = Math.min(beatDur * 2.5, limit - n.t);
-    // 太短没意义；长条要落在"有声音"的地方
-    if (dur > beatDur * 0.75 && analysis.energyAt(n.t + beatDur * 0.5) > 0.3) {
-      withHolds.push({ ...n, type: 'hold', dur });
-    } else {
-      withHolds.push(n);
-    }
-  }
-  const holds = withHolds.filter((n) => n.type === 'hold');
-  const final = withHolds.filter((n) => {
-    if (n.type === 'hold') return true;
-    return !holds.some((h) => h.lane === n.lane && n.t > h.t + 0.02 && n.t < h.t + h.dur + 0.05);
-  });
+  // ---- 6. 长条：只写在"接得住、成段、有呼吸"的位置 ----
+  const holdStats = {};
+  const final = placeHolds(limited.slice().sort((a, b) => a.t - b.t), analysis, cfg, beatDur, holdStats);
 
   // ---- 7. 特殊音符（需配合空格，双倍分数）----
   let lastSpecial = -9;
@@ -1164,6 +1413,8 @@ export function generateChart(analysis, diff, options = {}) {
       segments: struct.segs.map((x) => ({ tier: x.tier, start: x.start, len: x.len })),
       repeats: [...segRepeat.entries()],
     },
+    // 长条编排的诊断量：候选为什么被砍掉（room=同轨没空 / sustain=声音断了）
+    holdStats,
     pitchStats: {
       offered: planner.pitchOffered,
       used: planner.pitchUsed,
