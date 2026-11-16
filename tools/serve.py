@@ -235,6 +235,12 @@ def resolve(bvid):
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+    # .mjs 要按 JS 返回，否则浏览器拒绝 import
+    extensions_map = {
+        **http.server.SimpleHTTPRequestHandler.extensions_map,
+        ".mjs": "text/javascript",
+        ".js": "text/javascript",
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=ROOT, **kwargs)

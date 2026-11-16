@@ -34,4 +34,8 @@ tools/compare_report.md
 
 # Sparebeat 官方谱面（只做统计，不随代码分发）
 tools/_sbmaps/
+tools/_sbaudio/
+tools/_ids.json
+tools/_batch.json
+tools/batch_report.md
 tools/_sparebeat_priors.json
