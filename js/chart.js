@@ -28,6 +28,7 @@ export const DIFFICULTIES = [
     // 遇到密集段落会挤成一串，必须在这里掐掉。
     maxRunSlots: 1,
     maxPairs: 0,
+    fillMin: 0.05,
     minGap: 0.215,
     npsQuiet: 1.3,
     npsLoud: 3.4,
@@ -73,6 +74,7 @@ export const DIFFICULTIES = [
     fillDiv: 2,
     maxRunSlots: 2,
     maxPairs: 1,
+    fillMin: 0.055,
     minGap: 0.135,
     npsQuiet: 1.9,
     npsLoud: 4.3,
@@ -120,6 +122,7 @@ export const DIFFICULTIES = [
     // 所以这里优先保证密度，只掐"三连以上"。
     maxRunSlots: 3,
     maxPairs: 6,
+    fillMin: 0.06,
     minGap: 0.082,
     npsQuiet: 3.2,
     npsLoud: 5.8,
@@ -1230,10 +1233,20 @@ export function generateChart(analysis, diff, options = {}) {
         if (t >= t0 + barDur - 0.02) break;
         const tol = (barDur / 16) * 0.35;
         if (hasAt(timeline, t, tol) || hasAt(added, t, tol)) continue;
-        // 骨架上的格子只要"有一点声音"就补上 —— 谱师写谱也是这么做的：
-        // 踩镲很轻也要写，因为节奏骨架比响度更重要。
+        // 骨架上的格子要有一定分量的声音才补。原来阈值只有 0.035，
+        // 实测（tools/match.html）会让 HARD 的"踩点提升"掉到 2.8×：
+        // 补出来的音落在接近静音的位置，听起来就是"在瞎按"。
         const s = strengthAt(t);
-        if (s < 0.035) continue;
+        if (s < (cfg.fillMin ?? 0.035)) continue;
+        // 十六分补音的规矩：只有左右邻格"音量相当"才允许补。
+        // 隔壁已经有一个明显更响的音，还在这里补一个，就是凭空多按一下 ——
+        // 实测（tools/match.html）这种格子会把"踩点提升"拉低。
+        const s16 = barDur / 16;
+        const sL = strengthAt(t - s16);
+        const sR = strengthAt(t + s16);
+        const hasL = hasAt(timeline, t - s16, tol) || hasAt(added, t - s16, tol);
+        const hasR = hasAt(timeline, t + s16, tol) || hasAt(added, t + s16, tol);
+        if ((hasL && sL > s * 1.35) || (hasR && sR > s * 1.35)) continue;
         slots.push({ t, s });
       }
       // 骨架就是密度的上限：不再额外往骨架外撒音

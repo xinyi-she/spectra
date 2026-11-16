@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>谱面声音 × 原曲 · 特征对齐</title>
+<style>
+  body { background:#0d1117; color:#c9d1d9; font:13px/1.7 ui-monospace,Consolas,monospace; padding:24px; }
+  h1 { font-size:15px; color:#e6edf3; margin:0 0 4px; }
+  .sub { color:#8b949e; margin-bottom:16px; }
+  table { border-collapse:collapse; margin-top:10px; }
+  th,td { padding:4px 10px; text-align:right; border-bottom:1px solid #21262d; }
+  th { color:#8b949e; font-weight:500; }
+  td:first-child, th:first-child { text-align:left; }
+  canvas { display:block; margin-top:18px; background:#010409; border:1px solid #21262d; }
+</style>
+</head>
+<body>
+<h1>谱面“发声”和原曲的特征对齐</h1>
+<div class="sub" id="sub">分析中…</div>
+<table id="tbl"></table>
+<canvas id="cv" width="1100" height="260"></canvas>
+<script type="module">
+import { analyzeAudio } from '../js/analyzer.js';
+import { generateAll } from '../js/chart.js';
+
+const q = new URLSearchParams(location.search);
+const song = q.get('song') || 'spectra-demo.mp3';
+const sub = document.getElementById('sub');
+const SR = 48000;
+
+const corr = (a, b) => {
+  const n = Math.min(a.length, b.length);
+  let ma = 0, mb = 0;
+  for (let i = 0; i < n; i++) { ma += a[i]; mb += b[i]; }
+  ma /= n; mb /= n;
+  let sa = 0, sb = 0, sab = 0;
+  for (let i = 0; i < n; i++) {
+    const x = a[i] - ma, y = b[i] - mb;
+    sa += x * x; sb += y * y; sab += x * y;
+  }
+  return sa > 0 && sb > 0 ? sab / Math.sqrt(sa * sb) : 0;
+};
+
+/** 原始短时 RMS（不做任何归一化） */
+function rawRms(pcm, tSec, winSec, sr) {
+  const i0 = Math.max(0, Math.round((tSec - winSec / 2) * sr));
+  const i1 = Math.min(pcm.length, Math.round((tSec + winSec / 2) * sr));
+  if (i1 <= i0) return 0;
+  let acc = 0;
+  for (let i = i0; i < i1; i++) acc += pcm[i] * pcm[i];
+  return Math.sqrt(acc / (i1 - i0));
+}
+
+/** 把音符时刻画成一条 1/0 包络（帧率与分析器一致），可选平移做对照 */
+function noteEnvelope(notes, frameDur, frames, shift = 0) {
+  const env = new Float32Array(frames);
+  for (const n of notes) {
+    const f = Math.round((n.t + shift) / frameDur);
+    if (f < 0 || f >= frames) continue;
+    env[f] = 1;
+    // 前后各扩散一帧，容忍 20ms 级抖动
+    if (f > 0) env[f - 1] = Math.max(env[f - 1], 0.4);
+    if (f + 1 < frames) env[f + 1] = Math.max(env[f + 1], 0.4);
+  }
+  return env;
+}
+
+try {
+  const buf = await (await fetch('../assets/demo/' + song)).arrayBuffer();
+  const ctx = new OfflineAudioContext(1, 1024, SR);
+  const audio = await ctx.decodeAudioData(buf);
+  const songPcm = audio.getChannelData(0);
+  const dur = audio.duration;
+
+  // ---- 1. 原曲的特征曲线 ----
+  const aSong = analyzeAudio([Float32Array.from(songPcm)], SR);
+  const fd = aSong.frameDur;
+  const frames = aSong.onsetStrength.length;
+  const onset = aSong.onsetStrength;
+  const rmsSong = aSong.rms;
+
+  // 直接在当前代码上生成（而不是读取可能过期的 _gen_charts.json）
+  const charts = generateAll(aSong).map((c) => ({
+    name: c.name,
+    level: c.level,
+    notes: c.notes.map((n) => ({ t: n.t, type: n.type })),
+  }));
+  const beatDur = aSong.beatDur;
+  sub.textContent = `${song}  ${dur.toFixed(1)}s · ${charts.length} 档难度`;
+
+  // ---- 2. 每档谱面：把音符"发声"混进原曲，再抽一次特征 ----
+  const rows = [];
+  const curves = [];
+  for (const c of charts) {
+    const notes = c.notes;
+
+    // 2a. 音符包络 vs 原曲击打强度
+    const envN = noteEnvelope(notes, fd, frames, 0);
+    const envShift = noteEnvelope(notes, fd, frames, beatDur * 0.25); // 平移 1/4 拍做对照
+    const cAlign = corr(envN, onset);
+    const cShift = corr(envShift, onset);
+
+    // 2b. 音符时刻上的击打强度，相对全曲平均值
+    let atNotes = 0, cnt = 0;
+    for (const n of notes) {
+      const f = Math.round(n.t / fd);
+      if (f < 0 || f >= frames) continue;
+      let m = 0;
+      for (let k = -1; k <= 1; k++) m = Math.max(m, onset[Math.max(0, Math.min(frames - 1, f + k))]);
+      atNotes += m; cnt++;
+    }
+    const meanOnset = onset.reduce((s, v) => s + v, 0) / frames;
+    const lift = cnt ? atNotes / cnt / Math.max(1e-6, meanOnset) : 0;
+
+    // 2c. 合成"谱面发声"轨：短促三角波（和游戏里的打击音同一个味道）
+    const off = new OfflineAudioContext(1, Math.ceil(dur * SR), SR);
+    const out = off.createBuffer(1, Math.ceil(dur * SR), SR);
+    const ch = out.getChannelData(0);
+    const hitLen = Math.round(0.09 * SR);
+    const decay = new Float32Array(hitLen);
+    for (let i = 0; i < hitLen; i++) decay[i] = Math.exp(-i / (0.02 * SR));
+    for (const n of notes) {
+      const i0 = Math.round(n.t * SR);
+      const f0 = n.type === 'special' ? 1560 : 1180;
+      const g = n.type === 'special' ? 0.5 : 0.34;
+      for (let i = 0; i < hitLen && i0 + i < ch.length; i++) {
+        const t = i / SR;
+        ch[i0 + i] += Math.sin(2 * Math.PI * f0 * t) * decay[i] * g;
+      }
+    }
+
+    // 2d. 混音：原曲 + 发声轨（按游戏内音量比 0.9 : 0.34*0.5）
+    const mixed = new Float32Array(songPcm.length);
+    for (let i = 0; i < mixed.length; i++) mixed[i] = songPcm[i] + ch[i] * 0.55;
+
+    const aMix = analyzeAudio([mixed], SR);
+    const onsetMix = aMix.onsetStrength;
+    const rmsMix = aMix.rms;
+
+    // 2e. 混合前后：特征曲线相关 / 新增能量 / 新出现的重音
+    const cFlux = corr(onset, onsetMix);
+    let liftRms = 0, liftCnt = 0;
+    for (const n of notes) {
+      const a = rawRms(songPcm, n.t + 0.01, 0.05, SR);
+      const b = rawRms(mixed, n.t + 0.01, 0.05, SR);
+      if (a > 0.005) {
+        liftRms += 20 * Math.log10((b + 1e-9) / (a + 1e-9));
+        liftCnt++;
+      }
+    }
+    const dbLift = liftCnt ? liftRms / liftCnt : 0;
+    // 谱面"制造出来的新重音"：混合后明显上升、而原曲那里几乎是安静的帧
+    let newPeaks = 0;
+    for (let i = 1; i < frames; i++) {
+      if (onsetMix[i] > 0.25 && onset[i] < 0.08) newPeaks++;
+    }
+
+    // 对照基线：同样多的音、随机撒在同一时间范围里
+    const t0 = notes[0].t, t1 = notes[notes.length - 1].t;
+    const rnd = notes.map((n) => ({ t: t0 + Math.random() * (t1 - t0), type: 'tap' }));
+    const envR = noteEnvelope(rnd, fd, frames, 0);
+    let rAt = 0;
+    for (const n of rnd) {
+      const f = Math.round(n.t / fd);
+      if (f < 0 || f >= frames) continue;
+      let m = 0;
+      for (let k = -1; k <= 1; k++) m = Math.max(m, onset[Math.max(0, Math.min(frames - 1, f + k))]);
+      rAt += m;
+    }
+    const rndAlign = corr(envR, onset);
+    const rndLift = rAt / rnd.length / Math.max(1e-6, meanOnset);
+
+    rows.push({
+      name: `${c.name} Lv${c.level}`,
+      rndAlign,
+      rndLift,
+      notes: notes.length,
+      cAlign,
+      cShift,
+      lift,
+      cFlux,
+      dbLift,
+      newPeaks,
+    });
+    curves.push({ name: c.name, onset, onsetMix });
+  }
+
+  // ---- 3. 输出 ----
+  const tbl = document.getElementById('tbl');
+  const head = ['谱面', '音符', '包络相关', '随机基线', '平移对照', '踩点提升', '随机提升', '混音后特征相关', '音符处响度提升(dB)', '凭空重音'];
+  const tr = document.createElement('tr');
+  for (const h of head) {
+    const th = document.createElement('th');
+    th.textContent = h;
+    tr.appendChild(th);
+  }
+  tbl.appendChild(tr);
+  for (const r of rows) {
+    const t2 = document.createElement('tr');
+    const cells = [
+      r.name,
+      r.notes,
+      r.cAlign.toFixed(3),
+      r.rndAlign.toFixed(3),
+      r.cShift.toFixed(3),
+      r.lift.toFixed(2) + '×',
+      r.rndLift.toFixed(2) + '×',
+      r.cFlux.toFixed(3),
+      r.dbLift.toFixed(2),
+      r.newPeaks,
+    ];
+    cells.forEach((v, i) => {
+      const td = document.createElement(i === 0 ? 'th' : 'td');
+      td.textContent = v;
+      t2.appendChild(td);
+    });
+    tbl.appendChild(t2);
+  }
+
+  // 画前 20 秒的曲线对照
+  const cv = document.getElementById('cv');
+  const g2 = cv.getContext('2d');
+  const N = Math.min(frames, Math.round(20 / fd));
+  const draw = (arr, color, y0, h) => {
+    g2.beginPath();
+    g2.strokeStyle = color;
+    g2.lineWidth = 1;
+    for (let i = 0; i < N; i++) {
+      const x = (i / N) * cv.width;
+      const y = y0 + h - Math.min(1, arr[i]) * h;
+      i ? g2.lineTo(x, y) : g2.moveTo(x, y);
+    }
+    g2.stroke();
+  };
+  g2.fillStyle = '#8b949e';
+  g2.font = '11px monospace';
+  g2.fillText('原曲击打强度', 8, 14);
+  draw(onset, '#58a6ff', 20, 90);
+  g2.fillText('原曲 + 谱面发声', 8, 130);
+  draw(curves[curves.length - 1].onsetMix, '#f472b6', 136, 90);
+
+  console.log('MATCH ' + JSON.stringify({
+    song,
+    frameDur: fd,
+    rows: rows.map((r) => ({ ...r, cAlign: +r.cAlign.toFixed(4), rndAlign: +r.rndAlign.toFixed(4), cShift: +r.cShift.toFixed(4), lift: +r.lift.toFixed(3), rndLift: +r.rndLift.toFixed(3), cFlux: +r.cFlux.toFixed(4), dbLift: +r.dbLift.toFixed(2) })),
+  }));
+} catch (e) {
+  sub.textContent = 'ERROR ' + e.message;
+  console.log('MATCH ERROR ' + e.stack);
+}
+</script>
+</body>
+</html>
