@@ -23,6 +23,11 @@ export const DIFFICULTIES = [
     color: '#4ade80',
     gridDiv: 4,
     fillDiv: 2,
+    // 骨架里最多允许"相邻格"（= 十六分连打）成几连、成几对。
+    // Sparebeat 实测 hard 只有 27% 的间隔是十六分；按最响的 K 格挑骨架，
+    // 遇到密集段落会挤成一串，必须在这里掐掉。
+    maxRunSlots: 1,
+    maxPairs: 0,
     minGap: 0.215,
     npsQuiet: 1.3,
     npsLoud: 3.4,
@@ -66,6 +71,8 @@ export const DIFFICULTIES = [
     color: '#fbbf24',
     gridDiv: 4,
     fillDiv: 2,
+    maxRunSlots: 2,
+    maxPairs: 1,
     minGap: 0.135,
     npsQuiet: 1.9,
     npsLoud: 4.3,
@@ -74,8 +81,10 @@ export const DIFFICULTIES = [
     // 目标双押率（按位置权重缩放后约等于"音群中双押以上的比例"）
     // 骨架里有多少比例的槽位成为"重音位"，以及重音位上加倍的概率。
     // 目标：双押以上的音群占比 ≈ Sparebeat 实测的 12%（normal）/ 23%（hard）。
-    chordSlotShare: 0.15,
-    chordProb: 0.8,
+    chordSlotShare: 0.10,
+    // 1.0：重音位一旦定了就**每次都加倍**。人是按固定位置摆重音的，
+    // 留 15% 不加倍等于每小节的重音图案都不一样，动机感就没了。
+    chordProb: 1,
     allowFill: true,
     fillRate: 0.25,
     hold: {
@@ -106,13 +115,18 @@ export const DIFFICULTIES = [
     color: '#f472b6',
     gridDiv: 4,
     fillDiv: 4,
+    // HARD 的骨架本来就密（11~12 格 / 16），连串压太狠会把密度一起砍掉。
+    // 128 BPM 下小节比 Sparebeat 的 185 BPM 长，同样的 NPS 必然需要更多十六分，
+    // 所以这里优先保证密度，只掐"三连以上"。
+    maxRunSlots: 3,
+    maxPairs: 6,
     minGap: 0.082,
     npsQuiet: 3.2,
     npsLoud: 5.8,
     maxPerBar: 20,
     allowChord: true,
-    chordSlotShare: 0.28,
-    chordProb: 0.85,
+    chordSlotShare: 0.25,
+    chordProb: 1,
     allowFill: true,
     fillRate: 0.45,
     hold: {
@@ -1054,6 +1068,46 @@ export function generateChart(analysis, diff, options = {}) {
       const peakSlot = Math.max(...slotStrength);
       // 阈值放到 15%：人类谱面 94% 的小节都在正拍上放了音，宁可多踩一脚。
       if (peakSlot > 0 && slotStrength[0] >= peakSlot * 0.15) mask[0] = 1;
+
+      // 十六分连打要克制
+      if (cfg.maxRunSlots) {
+        const maxRun = cfg.maxRunSlots;
+        const maxPairs = cfg.maxPairs ?? 2;
+        for (let pass = 0; pass < 10; pass++) {
+          let runStart = -1;
+          let changed = false;
+          for (let i = 0; i <= 16; i++) {
+            const on = i < 16 && mask[i];
+            if (on && runStart < 0) runStart = i;
+            if (!on && runStart >= 0) {
+              if (i - runStart > maxRun) {
+                let weakest = runStart;
+                for (let k = runStart; k < i; k++) if (slotStrength[k] < slotStrength[weakest]) weakest = k;
+                mask[weakest] = 0;
+                changed = true;
+              }
+              runStart = -1;
+            }
+          }
+          if (changed) continue;
+          let pairs = 0;
+          for (let i = 0; i < 15; i++) if (mask[i] && mask[i + 1]) pairs++;
+          if (pairs <= maxPairs) break;
+          let drop = -1;
+          let worst = 1e9;
+          for (let i = 0; i < 15; i++) {
+            if (!mask[i] || !mask[i + 1]) continue;
+            const v = Math.min(slotStrength[i], slotStrength[i + 1]);
+            if (v < worst) {
+              worst = v;
+              drop = slotStrength[i] < slotStrength[i + 1] ? i : i + 1;
+            }
+          }
+          if (drop < 0) break;
+          mask[drop] = 0;
+        }
+        if (!mask[0] && peakSlot > 0 && slotStrength[0] >= peakSlot * 0.15) mask[0] = 1;
+      }
 
       // 双押槽位：**必须从音符骨架里挑**，否则会出现"有音就双押"。
       // 取骨架的 1/3 左右作为重音位，优先正拍/半拍（真实重音的 77% 在这两处）。
