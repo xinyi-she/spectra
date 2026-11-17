@@ -256,16 +256,26 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
     }
   }
 
-  // ---- 5. BPM ----
+  // ---- 5. BPM：tempo-octave 搜索 ----
   onProgress(0.8, '估算 BPM');
-  const lagMin = Math.max(2, Math.round(0.28 / frameDur));
-  const lagMax = Math.min(frames >> 1, Math.round(1.35 / frameDur));
+  // 从 2 帧起就要算：tempogram 的局部基线会采样到 0.17s 这种短 lag，
+  // 低 lag 留 0 会把快速度的基线压低、让打分系统性偏向快的那一层（实测 BPM 偏大 1.5 倍）
+  const lagMin = 2;
+  // 2.0s：小节项要算 4 拍的自相关，70 BPM 时 4 拍就是 3.4s，够不到的那几档就跳过小节项
+  const lagMax = Math.min(frames >> 1, Math.round(2.0 / frameDur));
   const ac = new Float64Array(lagMax + 2);
+  // 归一化用的能量前缀和
+  const epre = new Float64Array(frames + 1);
+  for (let i = 0; i < frames; i++) epre[i + 1] = epre[i] + os[i] * os[i];
   for (let lag = lagMin; lag <= lagMax; lag++) {
     let sum = 0;
     const n = frames - lag;
     for (let i = 0; i < n; i++) sum += os[i] * os[i + lag];
-    ac[lag] = sum / Math.max(1, n);
+    const e1 = epre[n];
+    const e2 = epre[frames] - epre[lag];
+    // 归一化互相关（余弦）：不除以能量的话，数值高低取决于整首响度，
+    // 拿它比不同长度的 lag 等于用两把尺子
+    ac[lag] = sum / Math.sqrt(e1 * e2 || 1);
   }
   const acAt = (lag) => {
     const L = Math.max(1, Math.min(lagMax, lag));
@@ -276,22 +286,50 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
     return a * (1 - fr) + b * fr;
   };
 
+  // 局部基线：±40%（去掉自身 ±6%）的平均自相关。
+  // 短 lag 天生比长 lag 更相关（包络平滑），不减掉的话会系统性偏向快的那一层。
+  const levelBase = (bd) => {
+    let sum = 0;
+    let n = 0;
+    for (let k = -40; k <= 40; k += 4) {
+      if (Math.abs(k) < 6) continue;
+      sum += acAt((bd * (1 + k / 100)) / frameDur);
+      n++;
+    }
+    return sum / Math.max(1, n);
+  };
+  const salience = (bd) => acAt(bd / frameDur) - levelBase(bd);
+
+  /**
+   * 候选拍长的可信度。
+   *
+   * 拍点自相关之外**还要看小节（4 拍）周期**：谱面是按 4/4 小节写的，
+   * 光看拍点的话"半速"读法（每两拍当一拍）和小节线都自洽，分不开。
+   * 实测加上小节项之后 54 首里多对 20 首。
+   *
+   * 再乘一个很宽的节拍先验打破八度平手：人耳一般把 100~190 当拍，
+   * 官方 54 首的 BPM 中位 165、范围 76~222。先验只占 45% 权重，
+   * 证据明显更强的那一层照样能赢（76 BPM 那首就保住了自己）。
+   */
+  const tempoPrior = (bpm) => Math.exp(-0.5 * Math.pow(Math.log2(bpm / 165) / 0.55, 2));
+  const scoreTempo = (bpm) => {
+    const bd = 60 / bpm;
+    let s = salience(bd);
+    if (bd * 4 <= lagMax * frameDur) s += 0.5 * salience(bd * 4);
+    return s * (0.55 + 0.45 * tempoPrior(bpm));
+  };
+
   let bestBpm = 120;
-  let bestScore = -1;
-  for (let bpm = 58; bpm <= 205; bpm += 0.25) {
-    const L = 60 / bpm / frameDur;
-    const comb = acAt(L) + 0.55 * acAt(L * 2) + 0.32 * acAt(L * 3) + 0.18 * acAt(L * 4);
-    // 轻微偏好 90–165 的常见区间
-    const prior = Math.exp(-Math.pow(Math.log2(bpm / 125) / 0.62, 2) * 0.5);
-    const score = comb * (0.75 + 0.25 * prior);
-    if (score > bestScore) {
-      bestScore = score;
+  let bestScore = -1e9;
+  for (let bpm = 70; bpm <= 230; bpm += 0.25) {
+    const s = scoreTempo(bpm);
+    if (s > bestScore) {
+      bestScore = s;
       bestBpm = bpm;
     }
   }
-  // 折叠到 75–180 区间
-  while (bestBpm < 75) bestBpm *= 2;
-  while (bestBpm > 180) bestBpm /= 2;
+  while (bestBpm < 70) bestBpm *= 2;
+  while (bestBpm > 230) bestBpm /= 2;
 
   // ---- 5.5 相位相干精修 BPM（关键：整首歌不能漂拍）----
   const coherence = (bpm) => {
@@ -375,104 +413,6 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
   }
   firstBeat = ((firstBeat % beatDur) + beatDur) % beatDur;
   bpm = Math.round((60 / beatDur) * 100) / 100;
-
-  // ---- 6.6 节拍层级校正（2/3 与 3/2 的误判）----
-  // 自相关很容易锁到"附点八分"或"三连音"那一层：54 首官方曲对照里有 10 首
-  // 检出值是官方值的 2/3（175 → 114.6），小节线因此整块错位，谱面怎么排都不在点上。
-  // 这里对 {bpm, 1.5×, 2/3×} 三个层级各自重新拟合网格，再比"哪个拍长更像真的周期"。
-  //
-  // 判据是**整首 onset 包络的归一化自相关**（余弦相似度）：
-  //     nac(τ) = Σ os[i]·os[i+τ] / sqrt(Σ os[i]² · Σ os[i+τ]²)
-  // 不能直接用第 5 节那个 ac[]：它是 Σos[i]·os[i+τ] / n，没除以能量，
-  // 所以数值高低取决于整首的响度，拿它比不同 lag 等于拿两把尺子量。
-  // 也不能直接比 nac：短 lag 天生比长 lag 更相关（包络平滑），会系统性偏向快的那层。
-  // 所以再减去 τ 附近（±40%，去掉自身 ±6%）的平均 nac —— 得到的是
-  // "这个周期比周围周期硬多少"，与 lag 长度基本无关
-  // （54 首、真值必在候选里的对照：未归一化 comb 80%，归一化后 80%，再减基线 85%）。
-  const nacAt = (lagSec) => {
-    const hi = (frames >> 1) - 1;
-    const L = Math.max(1, Math.min(hi, lagSec / frameDur));
-    const i0 = Math.floor(L);
-    const fr = L - i0;
-    const one = (l) => {
-      const n = frames - l;
-      if (n <= 2) return 0;
-      let s = 0, n1 = 0, n2 = 0;
-      for (let i = 0; i < n; i++) {
-        const a = os[i];
-        const b = os[i + l];
-        s += a * b;
-        n1 += a * a;
-        n2 += b * b;
-      }
-      const d = Math.sqrt(n1 * n2);
-      return d > 1e-9 ? s / d : 0;
-    };
-    return one(i0) * (1 - fr) + one(Math.min(hi, i0 + 1)) * fr;
-  };
-  const levelScore = (bd) => {
-    let sum = 0;
-    let n = 0;
-    for (let k = -40; k <= 40; k += 4) {
-      if (Math.abs(k) < 6) continue;
-      sum += nacAt(bd * (1 + k / 100));
-      n++;
-    }
-    return nacAt(bd) - sum / Math.max(1, n);
-  };
-
-  const fitLevel = (bpmGuess) => {
-    let bd = 60 / bpmGuess;
-    let ph = 0;
-    let bestSv = -1;
-    for (let p = 0; p < bd - 1e-6; p += 0.005) {
-      let sv = 0;
-      for (let k = 0; ; k++) {
-        const idx = Math.round((p + k * bd) / frameDur);
-        if (idx >= frames) break;
-        sv += os[idx];
-      }
-      if (sv > bestSv) {
-        bestSv = sv;
-        ph = p;
-      }
-    }
-    for (let iter = 0; iter < 3; iter++) {
-      let cnt = 0, sk = 0, st = 0, skk = 0, skt = 0;
-      for (const o of onsets) {
-        const k = Math.round((o.t - ph) / bd);
-        const resid = o.t - (ph + k * bd);
-        if (Math.abs(resid) > bd * 0.16) continue;
-        cnt++; sk += k; st += o.t; skk += k * k; skt += k * o.t;
-      }
-      const den = cnt * skk - sk * sk;
-      if (cnt < 12 || Math.abs(den) < 1e-9) break;
-      const bb = (cnt * skt - sk * st) / den;
-      const aa = (st - bb * sk) / cnt;
-      if (!isFinite(bb) || bb <= 0 || Math.abs(bb - bd) > bd * 0.03) break;
-      bd = bb;
-      ph = aa;
-    }
-    ph = ((ph % bd) + bd) % bd;
-    return { bpm: 60 / bd, beatDur: bd, phase: ph, lift: levelScore(bd) };
-  };
-
-  {
-    const cur = { bpm, beatDur, phase: firstBeat, lift: fitLevel(bpm).lift };
-    let best = cur;
-    for (const mult of [1.5, 2 / 3]) {
-      const cand = bpm * mult;
-      if (cand < 70 || cand > 210) continue;
-      const f = fitLevel(cand);
-      // 要求高出 0.02（≈ 相邻层级实测差距的一半），避免在骑墙的曲子上来回抖
-      if (f.lift > best.lift + 0.02) best = f;
-    }
-    if (best !== cur) {
-      beatDur = best.beatDur;
-      firstBeat = best.phase;
-      bpm = Math.round(best.bpm * 100) / 100;
-    }
-  }
 
   // ---- 7. 段落能量 ----
   const rms = new Float32Array(frames);
