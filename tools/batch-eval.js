@@ -177,7 +177,7 @@
 
       // 官方谱
       for (const diff of ['easy', 'normal', 'hard']) {
-        const p = parseSparebeat(data, diff);
+        const p = parseSparebeat(data, diff, { alignAudio: true });
         if (!p || p.notes.length < 50) continue;
         const m = evalBoth(p.notes, p.beat, p.offset, a);
         if (m) rows.push({ id, diff, src: 'sb', bpm: data.bpm, bpmRatio: +(a.bpm / data.bpm).toFixed(3), ...m });
@@ -186,7 +186,10 @@
       const ours = generateAll(a);
       ours.forEach((c, i) => {
         const notes = c.notes.map((n) => ({ t: n.t, lane: n.lane }));
-        const m = evalBoth(notes, a.beatDur, c.beatOffset, a);
+        // 网格一律用**官方 BPM**：拿自己检出的 BPM 当网格的话，BPM 判错成八度时
+        // 小节变长、16 格每个都翻倍宽，f1 会被虚高（实测 ×0.5/×2 的曲子 0.643 >
+        // BPM 正确的 0.601），这一列就失去可比性了。
+        const m = evalBoth(notes, 60 / data.bpm, c.beatOffset, a);
         const diff = ['easy', 'normal', 'hard'][i];
         if (m) rows.push({ id, diff, src: 'ours', bpm: +a.bpm.toFixed(1), bpmRatio: +(a.bpm / data.bpm).toFixed(3), ...m });
       });

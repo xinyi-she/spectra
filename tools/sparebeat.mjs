@@ -10,11 +10,27 @@
  *   ( )   进入 / 退出三连音模式（每小节 24 格）
  *   [ ]   BIND_START / END        对象行 {bpm} / {speed} / {barLine}
  */
-export function parseSparebeat(data, diff) {
+/**
+ * 官方谱的时钟比音频瞬态**晚约 35ms**。
+ *
+ * 三种独立方法在 54 首官方曲上量过（详见 docs/DESIGN.md）：
+ *   - 官方音符到最近「检测 onset」的有符号距离：中位 +37.8ms
+ *     （只取音符 60% 以上都落在 onset 上的 16 首，中位 +34.8ms）
+ *   - 官方音符到「波形上升沿」的距离：中位 +29ms
+ *   - 让「音符处能量」最高的整体平移：−40~−70ms（按 21ms 帧量化后与上面一致）
+ * 我们自己的检测 onset 到波形上升沿是 −0.7ms，所以不是检测器偏早。
+ *
+ * 这个常数只把两个文件对齐到同一时钟，**不改谱面本身**：默认不加，
+ * 只有拿谱面和音频对比时（batch-eval）才传 `alignAudio: true`。
+ */
+export const CHART_LAG_MS = 35;
+
+export function parseSparebeat(data, diff, { alignAudio = false } = {}) {
   const rows = data && data.map && data.map[diff];
   if (!rows) return null;
   let bpm = data.bpm;
-  let t = data.startTime || 0; // 毫秒
+  const lag = alignAudio ? CHART_LAG_MS : 0;
+  let t = (data.startTime || 0) - lag; // 毫秒
   const notes = [];
   const open = [null, null, null, null];
   let triplet = false;
@@ -69,7 +85,8 @@ export function parseSparebeat(data, diff) {
     bpm: data.bpm,
     bpmChanges,
     beat: 60 / data.bpm,
-    offset: (data.startTime || 0) / 1000,
+    offset: ((data.startTime || 0) - lag) / 1000,
+    lagMs: lag,
     hasTriplet: rows.some((r) => typeof r === 'string' && /[()]/.test(r)),
   };
 }

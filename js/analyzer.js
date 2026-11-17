@@ -377,11 +377,50 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
   bpm = Math.round((60 / beatDur) * 100) / 100;
 
   // ---- 6.6 节拍层级校正（2/3 与 3/2 的误判）----
-  // 自相关很容易锁到"附点八分"或"三连音"那一层：实测拿 56 首真实曲子对比，
-  // 检出 BPM 有 80% 是官方值的 2/3 —— 小节线因此整块错位，谱面怎么排都不在点上。
-  // 这里对 {bpm, 1.5×, 2/3×} 三个层级各自重新拟合网格，比较"拍点上的平均击打强度"，
-  // 明显更好的那一层胜出（要求高出 6%，避免来回抖）。
-  const meanOnset = os.reduce((a, b) => a + b, 0) / Math.max(1, frames);
+  // 自相关很容易锁到"附点八分"或"三连音"那一层：54 首官方曲对照里有 10 首
+  // 检出值是官方值的 2/3（175 → 114.6），小节线因此整块错位，谱面怎么排都不在点上。
+  // 这里对 {bpm, 1.5×, 2/3×} 三个层级各自重新拟合网格，再比"哪个拍长更像真的周期"。
+  //
+  // 判据是**整首 onset 包络的归一化自相关**（余弦相似度）：
+  //     nac(τ) = Σ os[i]·os[i+τ] / sqrt(Σ os[i]² · Σ os[i+τ]²)
+  // 不能直接用第 5 节那个 ac[]：它是 Σos[i]·os[i+τ] / n，没除以能量，
+  // 所以数值高低取决于整首的响度，拿它比不同 lag 等于拿两把尺子量。
+  // 也不能直接比 nac：短 lag 天生比长 lag 更相关（包络平滑），会系统性偏向快的那层。
+  // 所以再减去 τ 附近（±40%，去掉自身 ±6%）的平均 nac —— 得到的是
+  // "这个周期比周围周期硬多少"，与 lag 长度基本无关
+  // （54 首、真值必在候选里的对照：未归一化 comb 80%，归一化后 80%，再减基线 85%）。
+  const nacAt = (lagSec) => {
+    const hi = (frames >> 1) - 1;
+    const L = Math.max(1, Math.min(hi, lagSec / frameDur));
+    const i0 = Math.floor(L);
+    const fr = L - i0;
+    const one = (l) => {
+      const n = frames - l;
+      if (n <= 2) return 0;
+      let s = 0, n1 = 0, n2 = 0;
+      for (let i = 0; i < n; i++) {
+        const a = os[i];
+        const b = os[i + l];
+        s += a * b;
+        n1 += a * a;
+        n2 += b * b;
+      }
+      const d = Math.sqrt(n1 * n2);
+      return d > 1e-9 ? s / d : 0;
+    };
+    return one(i0) * (1 - fr) + one(Math.min(hi, i0 + 1)) * fr;
+  };
+  const levelScore = (bd) => {
+    let sum = 0;
+    let n = 0;
+    for (let k = -40; k <= 40; k += 4) {
+      if (Math.abs(k) < 6) continue;
+      sum += nacAt(bd * (1 + k / 100));
+      n++;
+    }
+    return nacAt(bd) - sum / Math.max(1, n);
+  };
+
   const fitLevel = (bpmGuess) => {
     let bd = 60 / bpmGuess;
     let ph = 0;
@@ -415,10 +454,7 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
       ph = aa;
     }
     ph = ((ph % bd) + bd) % bd;
-    // 判据用"整拍的自相关强度"：层级对了，拍长的周期在能量曲线上就是更硬的周期。
-    // 实测（56 首对照）2/3 层级的 ac(拍长) 会低 3~5%，而网格解释率区分不出来。
-    const lift = acAt(bd / frameDur);
-    return { bpm: 60 / bd, beatDur: bd, phase: ph, lift };
+    return { bpm: 60 / bd, beatDur: bd, phase: ph, lift: levelScore(bd) };
   };
 
   {
@@ -428,7 +464,8 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
       const cand = bpm * mult;
       if (cand < 70 || cand > 210) continue;
       const f = fitLevel(cand);
-      if (f.lift > best.lift * 1.025) best = f;
+      // 要求高出 0.02（≈ 相邻层级实测差距的一半），避免在骑墙的曲子上来回抖
+      if (f.lift > best.lift + 0.02) best = f;
     }
     if (best !== cur) {
       beatDur = best.beatDur;
