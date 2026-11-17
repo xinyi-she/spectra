@@ -36,6 +36,7 @@
       semi: o.semi != null ? Math.round(o.semi * 10) / 10 : null,
       clar: o.clarity != null ? Math.round(o.clarity * 100) / 100 : null,
       stable: !!o.stable,
+      sustain: !!o.sustain,
     })),
     charts: charts.map((c) => ({
       name: c.name,

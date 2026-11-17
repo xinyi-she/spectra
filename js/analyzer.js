@@ -175,6 +175,9 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
   const pWin = Math.round(0.058 * pRate); // ~58ms，够看清 90Hz 的五个周期
   const pLead = Math.round(0.016 * pRate); // 跳过起音瞬态
   const pLen = pSig.length;
+  // 长音检查用的第二个取样点：起音后 110ms。人声/主奏会在这里继续唱同一个音，
+  // 鼓和镲不会 —— 这是判断"这一下是不是有人在唱"最便宜的证据。
+  const pTail = Math.round(0.11 * pRate);
   const semis = [];
   for (const o of onsets) {
     const start = Math.round(o.t * pRate) + pLead;
@@ -182,6 +185,7 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
       o.hz = 0;
       o.clarity = 0;
       o.semi = NaN;
+      o.sustain = false;
       continue;
     }
     const r = yinPitch(pSig, start, pWin, pRate, 90, 1100);
@@ -189,6 +193,25 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
     o.clarity = r.clarity;
     o.semi = r.semi;
     if (r.clarity >= CLARITY_MIN && isFinite(r.semi)) semis.push(r.semi);
+    o.sustain = false;
+    const tail = start + pTail + pWin;
+    if (tail < pLen) {
+      const r2 = yinPitch(pSig, start + pTail, pWin, pRate, 90, 1100);
+      if (r.clarity >= 0.45 && isFinite(r.semi) && r2.clarity >= 0.45 && isFinite(r2.semi) &&
+          Math.abs(r2.semi - r.semi) <= 1.5) {
+        o.sustain = true;
+      }
+      // 起音窗被瞬态污染时换"晚一点"的窗兜底：这是人声/主奏最容易被漏掉的一类
+      // （辅音、鼓点叠在上面，前 58ms 根本没有稳定周期）。补回来的音高照样能用，
+      // 而且它必然是"延续着的声音"，所以直接算长音。
+      if (r.clarity < 0.45 && r2.clarity >= 0.5 && isFinite(r2.semi)) {
+        o.hz = r2.hz;
+        o.semi = r2.semi;
+        o.clarity = r2.clarity * 0.9;
+        o.sustain = true;
+        if (o.clarity >= CLARITY_MIN) semis.push(o.semi);
+      }
+    }
   }
 
   // 音高分布：中位数 + 10~90 分位跨度，谱面用它把"绝对音高"换成"相对高低"

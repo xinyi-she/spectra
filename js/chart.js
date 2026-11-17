@@ -202,7 +202,10 @@ function clusterOnsets(onsets, maxGap = 0.048) {
         last.clarity = o.clarity;
         last.hz = o.hz;
         last.stable = o.stable;
+        last.sustain = o.sustain;
       }
+      // 长音是"有没有人在唱"的强证据，同一簇里有一个就够了
+      if (o.sustain) last.sustain = true;
     } else {
       out.push({
         t: o.t,
@@ -213,6 +216,7 @@ function clusterOnsets(onsets, maxGap = 0.048) {
         clarity: o.clarity,
         hz: o.hz,
         stable: o.stable,
+        sustain: o.sustain,
       });
     }
   }
@@ -984,6 +988,7 @@ export function generateChart(analysis, diff, options = {}) {
       semi: e.semi,
       clarity: e.clarity,
       stable: e.stable,
+      sustain: e.sustain,
     };
     const prev = bySlot.get(slot);
     if (!prev || cand.score > prev.score) bySlot.set(slot, cand);
@@ -1077,7 +1082,8 @@ export function generateChart(analysis, diff, options = {}) {
     for (const o of list) {
       // 人声槽位也要够响：轻声的伴唱、弱拍上的吉他泛音标进来只会把谱面拖散。
       // 官方 hard 谱 f1 高，正说明他们的音符大多落在"这一小节里明显响"的位置。
-      const voice = o.stable && (o.clarity || 0) >= 0.5 && o.semi >= VOICE_LO && o.semi <= VOICE_HI;
+      const voice =
+        (o.stable || o.sustain) && (o.clarity || 0) >= 0.45 && o.semi >= VOICE_LO && o.semi <= VOICE_HI;
       if (voice && peakS > 0 && o.s >= peakS * 0.35) vs[o.slot] = 1;
       if (peakS > 0 && o.s >= peakS * 0.45 && o.tone !== 'hat') as[o.slot] = 1;
     }
