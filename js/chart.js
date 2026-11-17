@@ -57,8 +57,11 @@ export const DIFFICULTIES = [
     },
     specialChance: 0.02,
     maxNps: 3.6,
-    levelBase: 1,
-    levelScale: 1.15,
+    // 等级 = levelBase + levelScale × nps，参数来自官方 165 张谱的线性拟合
+    // （easy 1.88 + 0.71、normal 3.03 + 0.89、hard 3.91 + 1.09），
+    // 这样同一个数字在两边意味着同一档难度。原来 hard 是 8 + 0.62，比官方高约 2 级。
+    levelBase: 1.9,
+    levelScale: 0.71,
     // 手感参数
     jack: 0.09,      // 同键连打权重
     trill: 1.6,
@@ -106,8 +109,8 @@ export const DIFFICULTIES = [
     },
     specialChance: 0.05,
     maxNps: 6.2,
-    levelBase: 4.5,
-    levelScale: 0.75,
+    levelBase: 3.0,
+    levelScale: 0.89,
     jack: 0.09,
     trill: 1.8,
     jump: 0.65,
@@ -151,8 +154,8 @@ export const DIFFICULTIES = [
     },
     specialChance: 0.07,
     maxNps: 9.6,
-    levelBase: 8,
-    levelScale: 0.62,
+    levelBase: 3.9,
+    levelScale: 1.09,
     jack: 0.035,     // 高速下同键连打几乎不可接受
     trill: 2.0,
     jump: 0.55,
@@ -818,96 +821,76 @@ function placeHolds(notes, analysis, cfg, beatDur, rng, stats = null) {
       rej.room++;
       continue;
     }
+    const vocal = !!n.sustain; // 人声/主奏在这个音上"延续着"，是长条最硬的依据
     const span = sustainSpan(analysis, n.t, Math.min(room, H.maxBeats * beatDur), minLen);
     if (!span) {
       rej.quiet++;
       continue;
     }
-    if (span.q < H.sustain) {
+    // 唱出来的音可以放宽"声音塌陷"的门槛：长条本来就是在写这个延续
+    if (span.q < (vocal ? H.sustain * 0.55 : H.sustain)) {
       rej.sustain++;
       continue;
     }
     const beats = (n.t - firstBeat) / beatDur;
     const onBeat = Math.abs(beats - Math.round(beats)) < 0.06;
     const strength = Math.min(1, (n.s || 0.5) * 1.6);
-    cands.push({ n, len: span.len, q: span.q * (0.7 + 0.3 * strength) * (onBeat ? 1.3 : 1) });
+    const bonus = vocal ? 2.4 : 1;
+    cands.push({ n, len: span.len, vocal, q: span.q * (0.7 + 0.3 * strength) * (onBeat ? 1.3 : 1) * bonus });
   }
   if (stats) Object.assign(stats, rej, { cands: cands.length, budget });
   if (!cands.length) return notes;
 
-  // ---- 2. 每小节留一个最好的候选 ----
-  const barBest = new Map();
-  for (const c of cands) {
-    const b = barOf(c.n.t);
-    const cur = barBest.get(b);
-    if (!cur || c.q > cur.q) barBest.set(b, c);
-  }
-
-  // ---- 3. 成段挑选：长条只在"某几个乐句"里出现 ----
-  // Sparebeat 实测：只有 8% 的小节含长条，最长连续 2 小节，而长条占音符 2%。
-  // 也就是说长条是**局部现象**，一出现就是一小段"长条句"，然后长时间没有。
-  const barList = [...barBest.keys()].sort((a, b) => a - b);
-  const phrases = [];
-  let run = [];
-  for (const b of barList) {
-    if (run.length && b === run[run.length - 1] + 1) run.push(b);
-    else {
-      if (run.length) phrases.push(run);
-      run = [b];
-    }
-  }
-  if (run.length) phrases.push(run);
-  const phraseScore = (ph) => ph.reduce((s, b) => s + barBest.get(b).q, 0) / Math.sqrt(ph.length);
-  phrases.sort((a, b) => phraseScore(b) - phraseScore(a));
-
+  // ---- 2. 贪心落地 ----
+  // 原来先按"4 小节短语"分组、每句只取中段，这套假设是"候选只出现在少数小节"。
+  // 改成按人声排谱后几乎每个小节都有候选，短语就只剩 1~2 段、长条也只剩 4 根
+  // （实测 HARD：cands 377 / budget 19 / chosen 4，预算根本没用上）。
+  // 现在按分数从高到低逐个试，约束是：头部间隔、同轨同手不重叠、连续不超过 phraseBars 个小节。
+  cands.sort((a, b) => b.q - a.q);
   const barCount = Math.max(1, Math.round((notes[notes.length - 1].t - notes[0].t) / barDur));
   const maxBars = Math.max(1, Math.round(barCount * (H.coverage || 0.1)));
-  const planned = [];
-  let barsPlanned = 0;
-  for (const ph of phrases) {
-    if (barsPlanned >= maxBars) break;
-    const take = Math.min(ph.length, H.phraseBars);
-    if (barsPlanned + take > maxBars && planned.length) continue;
-    planned.push({ ph, take, start: Math.floor((ph.length - take) / 2) });
-    barsPlanned += take;
-  }
-  // 先挑后排：间距检查依赖"上一个长条"的位置，乱序落地会把时间判断搞错
-  planned.sort((a, b) => a.ph[a.start] - b.ph[b.start]);
 
-  // ---- 4. 落地 ----
   const chosen = new Map(); // note -> len
-  const laneFreeAt = [0, 0, 0, 0];
-  const handFreeAt = [0, 0];
-  let lastHead = -1e9;
-  const drop = { gap: 0, lane: 0, hand: 0 };
-
-  for (const { ph, take, start } of planned) {
-    if (chosen.size >= budget) break;
-    for (let i = start; i < start + take; i++) {
-      if (chosen.size >= budget) break;
-      const c = barBest.get(ph[i]);
-      if (!c) continue;
-      const t = c.n.t;
-      if (t - lastHead < H.headGapBeats * beatDur) {
-        drop.gap++;
-        continue;
-      }
-      if (t < laneFreeAt[c.n.lane]) {
-        drop.lane++;
-        continue;
-      }
-      const hand = c.n.lane < 2 ? 0 : 1;
-      if (t < handFreeAt[hand]) {
-        drop.hand++;
-        continue;
-      }
-      chosen.set(c.n, c.len);
-      laneFreeAt[c.n.lane] = t + c.len + breath;
-      handFreeAt[hand] = t + c.len + breath;
-      lastHead = t;
+  const placed = []; // { t, len, lane }
+  const heldBars = new Set();
+  const drop = { gap: 0, lane: 0, hand: 0, chain: 0 };
+  const spacingOk = (t) => {
+    for (const p of placed) if (Math.abs(p.t - t) < H.headGapBeats * beatDur) return false;
+    return true;
+  };
+  const overlapOk = (t, len, lane) => {
+    for (const p of placed) {
+      if (p.lane !== lane && (p.lane < 2) !== (lane < 2)) continue;
+      if (t >= p.t && t < p.t + p.len + breath) return false;
+      if (p.t >= t && p.t < t + len + breath) return false;
     }
+    return true;
+  };
+
+  for (const c of cands) {
+    if (chosen.size >= budget) break;
+    const t = c.n.t;
+    const b = barOf(t);
+    // 含长条的小节总数上限（人类是 8~13%）
+    if (heldBars.size >= maxBars && !heldBars.has(b)) continue;
+    if (!spacingOk(t)) {
+      drop.gap++;
+      continue;
+    }
+    if (!overlapOk(t, c.len, c.n.lane)) {
+      drop.lane++;
+      continue;
+    }
+    // 连续小节上限：这一小节还没长条、但前两小节都有 → 放弃（"成句"但不成串）
+    if (!heldBars.has(b) && heldBars.has(b - 1) && heldBars.has(b - 2)) {
+      drop.chain++;
+      continue;
+    }
+    chosen.set(c.n, c.len);
+    placed.push({ t, len: c.len, lane: c.n.lane });
+    heldBars.add(b);
   }
-  if (stats) Object.assign(stats, drop, { chosen: chosen.size, phrases: phrases.length });
+  if (stats) Object.assign(stats, drop, { chosen: chosen.size, phrases: placed.length });
   if (!chosen.size) return notes;
 
   // ---- 5. 长条期间"让位"----
@@ -1085,7 +1068,9 @@ export function generateChart(analysis, diff, options = {}) {
       const voice =
         (o.stable || o.sustain) && (o.clarity || 0) >= 0.45 && o.semi >= VOICE_LO && o.semi <= VOICE_HI;
       if (voice && peakS > 0 && o.s >= peakS * 0.35) vs[o.slot] = 1;
-      if (peakS > 0 && o.s >= peakS * 0.45 && o.tone !== 'hat') as[o.slot] = 1;
+      // 重音只按响度挑：踩镲里也有真重音（backbeat 上的开镲），一刀切掉会让
+      // 副歌的密度掉一半。tone 本身只是频谱重心，分不出"轻镲"和"重镲"。
+      if (peakS > 0 && o.s >= peakS * 0.55) as[o.slot] = 1;
     }
     voiceSlots.set(b, vs);
     accentSlots.set(b, as);
@@ -1345,6 +1330,7 @@ export function generateChart(analysis, diff, options = {}) {
     semi: e.semi,
     clarity: e.clarity,
     stable: e.stable,
+    sustain: e.sustain,
   }));
   const hasAt = (arr, t, tol) => arr.some((n) => Math.abs(n.t - t) < tol);
   if (cfg.allowFill) {

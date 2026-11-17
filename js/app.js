@@ -368,7 +368,8 @@ const LIBRARY_SEED = [
     source: '内置示例 · 128 BPM',
     builtin: true,
     bpm: 128,
-    levels: [4, 8, 12],
+    // 占位值，分析完会用真实等级覆盖；跟着 chart.js 的等级公式走（Lv 已经按官方谱校准过）
+    levels: [4, 7, 9],
   },
   {
     key: 'demo-tenfold',
@@ -380,7 +381,7 @@ const LIBRARY_SEED = [
     bvid: 'BV1k3S7BkEag',
     builtin: true,
     bpm: 130,
-    levels: [4, 7, 12],
+    levels: [4, 7, 9],
   },
   {
     key: 'demo-worldexec',
@@ -392,7 +393,7 @@ const LIBRARY_SEED = [
     bvid: 'BV1xCai6aE9g',
     builtin: true,
     bpm: 130,
-    levels: [4, 7, 13],
+    levels: [4, 6, 9],
   },
 ];
 const LIB_KEY = 'spectra.biliSongs';

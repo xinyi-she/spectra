@@ -124,6 +124,35 @@
     };
   }
 
+  /**
+   * 每个音符落在什么性质的起音上：人声 / 只踩镲 / 都不是。
+   * 这是"按音节写谱"这条线唯一的直接标尺 —— 官方谱如果也是跟着唱写，
+   * 它的 onVoice 就会明显高于随机，拿它当基准才公平。
+   */
+  function alignStats(notes, onsets) {
+    if (!onsets || !onsets.length || !notes.length) return { onOnset: 0, onVoice: 0, onHat: 0 };
+    const ts = onsets.map((o) => o.t);
+    const near = (t) => {
+      let lo = 0, hi = ts.length - 1;
+      while (hi - lo > 1) { const m = (lo + hi) >> 1; if (ts[m] < t) lo = m; else hi = m; }
+      let bi = lo, bd = Math.abs(t - ts[lo]);
+      const dd = Math.abs(t - ts[hi]);
+      if (dd < bd) { bd = dd; bi = hi; }
+      return { o: onsets[bi], d: t - ts[bi] };
+    };
+    let onOnset = 0, onVoice = 0, onHat = 0;
+    for (const n of notes) {
+      const r = near(n.t);
+      if (Math.abs(r.d) > 0.045) continue;
+      onOnset++;
+      const o = r.o;
+      const isV = (o.stable || o.sustain) && (o.clarity || 0) >= 0.45 && o.semi >= 43 && o.semi <= 82;
+      if (isV) onVoice++;
+      else if (o.tone === 'hat') onHat++;
+    }
+    return { onOnset: onOnset / notes.length, onVoice: onVoice / notes.length, onHat: onHat / notes.length };
+  }
+
   /** 在 ±250ms 内扫出让 lift 最高的整体偏移 */
   function bestOffset(notes, onset, frameDur) {
     const frames = onset.length;
@@ -152,6 +181,7 @@
     const m1 = evaluate(notes, beat, offset, a.onsetStrength, a.frameDur, bo.dt);
     return {
       ...m0,
+      ...alignStats(notes, a.onsets),
       f1Best: m1.f1,
       barCorrBest: m1.barCorr,
       liftBest: bo.lift,

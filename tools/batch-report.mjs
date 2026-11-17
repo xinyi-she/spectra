@@ -27,7 +27,7 @@ const group = (src, diff) => rows.filter((r) => r.src === src && r.diff === diff
 const diffs = ['easy', 'normal', 'hard'];
 
 console.log(`样本：${new Set(rows.map((r) => r.id)).size} 首曲，${rows.length} 张谱\n`);
-console.log('来源      难度    谱数   f1     小节相关  lift   最优lift  小节线对齐  偏移中位');
+console.log('来源      难度    谱数   f1     人声%  只踩镲%   lift   最优lift  小节线对齐  偏移中位');
 const summary = {};
 for (const src of ['sb', 'ours']) {
   for (const d of diffs) {
@@ -36,6 +36,8 @@ for (const src of ['sb', 'ours']) {
     summary[src + '-' + d] = {
       n: g.length,
       f1: mean(g.map((r) => r.f1)),
+      onVoice: mean(g.map((r) => r.onVoice || 0)),
+      onHat: mean(g.map((r) => r.onHat || 0)),
       barCorr: mean(g.map((r) => r.barCorr)),
       lift: mean(g.map((r) => r.lift)),
       liftBest: mean(g.map((r) => r.liftBest)),
@@ -45,7 +47,7 @@ for (const src of ['sb', 'ours']) {
     const s = summary[src + '-' + d];
     console.log(
       `${(src === 'sb' ? 'Sparebeat' : '本作').padEnd(9)}${d.padEnd(7)}${String(s.n).padStart(4)}  ` +
-        `${F(s.f1).padStart(6)}  ${F(s.barCorr).padStart(7)}  ${F(s.lift, 2).padStart(5)}  ` +
+        `${F(s.f1).padStart(6)}  ${(s.onVoice * 100).toFixed(0).padStart(5)}%  ${(s.onHat * 100).toFixed(1).padStart(6)}%  ${F(s.lift, 2).padStart(5)}  ` +
         `${F(s.liftBest, 2).padStart(6)}  ${(s.shift0 * 100).toFixed(0).padStart(8)}%  ${String(s.shiftMs).padStart(6)}ms`
     );
   }
@@ -92,14 +94,14 @@ const md = [
   '',
   `样本：${new Set(rows.map((r) => r.id)).size} 首 Sparebeat 官方曲目，官方谱与自动谱各 3 档。`,
   '',
-  '| 来源 | 难度 | 谱数 | f1 | 小节相关 | lift | 最优 lift | 小节线对齐 | 偏移中位 |',
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  '| 来源 | 难度 | 谱数 | f1 | 人声% | 只踩镲% | lift | 最优 lift | 小节线对齐 | 偏移中位 |',
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
   ...['sb', 'ours'].flatMap((src) =>
     diffs
       .filter((d) => summary[src + '-' + d])
       .map((d) => {
         const s = summary[src + '-' + d];
-        return `| ${src === 'sb' ? 'Sparebeat' : '本作'} | ${d} | ${s.n} | ${F(s.f1)} | ${F(s.barCorr)} | ${F(s.lift, 2)} | ${F(s.liftBest, 2)} | ${(s.shift0 * 100).toFixed(0)}% | ${s.shiftMs}ms |`;
+        return `| ${src === 'sb' ? 'Sparebeat' : '本作'} | ${d} | ${s.n} | ${F(s.f1)} | ${(s.onVoice * 100).toFixed(0)}% | ${(s.onHat * 100).toFixed(1)}% | ${F(s.lift, 2)} | ${F(s.liftBest, 2)} | ${(s.shift0 * 100).toFixed(0)}% | ${s.shiftMs}ms |`;
       })
   ),
   '',

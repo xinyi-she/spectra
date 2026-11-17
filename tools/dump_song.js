@@ -41,6 +41,7 @@
     charts: charts.map((c) => ({
       name: c.name,
       level: c.level,
+      holdStats: c.holdStats,
       notes: c.notes.map((n) => ({
         t: Math.round(n.t * 1000) / 1000,
         lane: n.lane,
