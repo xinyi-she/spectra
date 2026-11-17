@@ -29,6 +29,9 @@ export const DIFFICULTIES = [
     maxRunSlots: 1,
     maxPairs: 0,
     fillMin: 0.05,
+    // 有唱的小节按人声断句排，而不是按 4 小节平均能量排（否则是均匀八分音符流）
+    voiceFirst: true,
+    maxMask: 6,
     minGap: 0.215,
     npsQuiet: 1.3,
     npsLoud: 3.4,
@@ -75,6 +78,8 @@ export const DIFFICULTIES = [
     maxRunSlots: 2,
     maxPairs: 1,
     fillMin: 0.055,
+    voiceFirst: true,
+    maxMask: 10,
     minGap: 0.135,
     npsQuiet: 1.9,
     npsLoud: 4.3,
@@ -123,6 +128,8 @@ export const DIFFICULTIES = [
     maxRunSlots: 3,
     maxPairs: 6,
     fillMin: 0.06,
+    voiceFirst: true,
+    maxMask: 14,
     minGap: 0.082,
     npsQuiet: 3.2,
     npsLoud: 5.8,
@@ -1036,6 +1043,48 @@ export function generateChart(analysis, diff, options = {}) {
   // 双押也要有动机：真实谱面里重音是"每小节同一位置都加重"，
   // 而不是每小节随机挑几个音加倍 —— 后者听起来就是噪音。
   const barChordMask = new Map();
+
+  // ---- 3.3 人声槽位：有唱的小节，节奏型跟着"唱"走 ----
+  // 原来骨架是「4 小节对应槽位的平均击打强度」挑出来的。可是踩镲每半拍一下、
+  // 在四小节里完全一样，平均之后就是一条均匀的八分音符流 —— 这就是"没有节奏感"：
+  // 音都在声音上，但每一拍的分量一样，听不出句读。
+  //
+  // 人耳抓的是旋律和断句。YIN 已经给每个起音算过音高和可信度，所以先把
+  // "有稳定音高、在人的音域里"的起音标成人声槽位（合唱/吉他/合成主奏同样会被标上，
+  // 它们本来也都是"听得出来的那条线"）。这些格子优先成骨架，
+  // 剩下的空位只补鼓点重音（kick / snare），**不补踩镲**。
+  const VOICE_LO = 43; // G2
+  const VOICE_HI = 82; // A#5
+  // 先把每个小节的起音按槽位收起来，再一次性算出「人声槽位」和「重音槽位」。
+  // 重音不能靠 onset.tone 判断 —— tone 是按频谱重心分的（air 占优就算 hat），
+  // 现代混音里连军鼓都会被判成 hat，结果"重音"只剩零星几个。改成按响度：
+  // 比本小节最强起音的一半还响的，才算重音。
+  const barEvents = new Map();
+  for (const e of events) {
+    const b = barOf(e.t);
+    const rel = (e.t - firstBeat - b * barDur) / barDur;
+    const slot = Math.min(15, Math.max(0, Math.round(rel * 16) % 16));
+    if (!barEvents.has(b)) barEvents.set(b, []);
+    barEvents.get(b).push({ slot, s: e.s, tone: e.tone, stable: e.stable, semi: e.semi, clarity: e.clarity });
+  }
+  const voiceSlots = new Map(); // bar -> Uint8Array(16)，有稳定音高的起音
+  const accentSlots = new Map(); // bar -> Uint8Array(16)，本小节响度前 55% 的起音
+  for (const [b, list] of barEvents) {
+    const vs = new Uint8Array(16);
+    const as = new Uint8Array(16);
+    let peakS = 0;
+    for (const o of list) if (o.s > peakS) peakS = o.s;
+    for (const o of list) {
+      // 人声槽位也要够响：轻声的伴唱、弱拍上的吉他泛音标进来只会把谱面拖散。
+      // 官方 hard 谱 f1 高，正说明他们的音符大多落在"这一小节里明显响"的位置。
+      const voice = o.stable && (o.clarity || 0) >= 0.5 && o.semi >= VOICE_LO && o.semi <= VOICE_HI;
+      if (voice && peakS > 0 && o.s >= peakS * 0.35) vs[o.slot] = 1;
+      if (peakS > 0 && o.s >= peakS * 0.45 && o.tone !== 'hat') as[o.slot] = 1;
+    }
+    voiceSlots.set(b, vs);
+    accentSlots.set(b, as);
+  }
+
   {
     const P = 4;
     const barLo = Math.min(...barKeys);
@@ -1139,6 +1188,78 @@ export function generateChart(analysis, diff, options = {}) {
           barChordMask.set(b, chordMask);
         }
       });
+    }
+  }
+
+  // ---- 3.4 人声优先：有唱的小节跟着音节排 ----
+  // 之前骨架是「4 小节对应槽位的平均击打强度」挑出来的。踩镲每半拍一下、四小节里
+  // 完全一样，平均之后就是一条均匀的八分音符流 —— 音都在声音上，但每一拍分量相同，
+  // 听不出句读，这就是"没有节奏感"。
+  //
+  // 现在：一小节里有 ≥2 个稳定音高的起音（人声/主奏）就按这些音节排，
+  // 不够密只补"本小节响度前 55%"的重音；没唱的小节交回短语骨架（那一段本来只有鼓）。
+  if (cfg.voiceFirst) {
+    const chordK = 1 + 0.5 * (cfg.allowChord ? (cfg.chordSlotShare || 0) * (cfg.chordProb || 0) : 0);
+    const capFor = (b) => {
+      const dens = Math.round((barTarget.get(b) || 4) / chordK);
+      return Math.max(2, Math.min(cfg.maxMask || 16, dens));
+    };
+    for (const b of barKeys) {
+      const t0 = firstBeat + b * barDur;
+      const st = new Float32Array(16);
+      for (let i = 0; i < 16; i++) st[i] = strengthAt(t0 + (i / 16) * barDur);
+      const peak = Math.max(...st);
+      const vs = voiceSlots.get(b);
+      const acc = accentSlots.get(b);
+      if (!vs) continue;
+      let vc = 0;
+      for (let i = 0; i < 16; i++) vc += vs[i];
+      if (vc < 2) continue; // 一两个音说明这段没在唱，交给鼓
+      const mask = Uint8Array.from(vs);
+      // 密度目标不能把音节砍掉；音节多的时候也别全塞进去
+      // （EASY 6 / NORMAL 10 / HARD 14 是一格里最多能读出来的音数）
+      const cap = Math.max(Math.min(vc, cfg.maxMask || 16), Math.min(capFor(b), cfg.maxMask || 16));
+      // 正拍 / 反拍底鼓位：人类谱面 94% 的小节都踩正拍，第三节（8 号格）是军鼓位。
+      // 人声断句偶尔会绕开这两个位置，但谱面踩上去才"站得住"。
+      if (peak > 0 && st[0] >= peak * 0.15) mask[0] = 1;
+      if (peak > 0 && st[8] >= peak * 0.5) mask[8] = 1;
+      const count = () => {
+        let c = 0;
+        for (let i = 0; i < 16; i++) c += mask[i];
+        return c;
+      };
+      // 不够密：只补本小节的重音位（响度前 55%），不补踩镲 —— 补镲就又变回均匀八分
+      if (count() < cap && acc) {
+        const cands = [];
+        for (let i = 0; i < 16; i++) if (!mask[i] && acc[i]) cands.push(i);
+        cands.sort((x, y) => st[y] - st[x]);
+        for (const i of cands) {
+          if (count() >= cap) break;
+          mask[i] = 1;
+        }
+      }
+      // 太密：砍最弱的（正拍不动）
+      while (count() > cap) {
+        let worst = -1;
+        let wv = 1e9;
+        for (let i = 1; i < 16; i++) {
+          if (mask[i] && st[i] < wv) {
+            wv = st[i];
+            worst = i;
+          }
+        }
+        if (worst < 0) break;
+        mask[worst] = 0;
+      }
+      barMask.set(b, mask);
+      // 重音位跟着新骨架重算，否则双押会落在骨架外
+      const slots = [];
+      for (let i = 0; i < 16; i++) if (mask[i]) slots.push(i);
+      const order = slots.slice().sort((x, y) => st[y] * CHORD_SLOT_WEIGHT[y] - st[x] * CHORD_SLOT_WEIGHT[x]);
+      const k2 = Math.max(1, Math.min(6, Math.round(slots.length * (cfg.chordSlotShare ?? 0.18))));
+      const cm = new Uint8Array(16);
+      for (let c = 0; c < k2 && c < order.length; c++) cm[order[c]] = 1;
+      barChordMask.set(b, cm);
     }
   }
 
