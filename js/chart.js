@@ -1,5 +1,6 @@
 import { mulberry32 } from './fft.js';
 import { PRIORS, CHORD_SLOT_WEIGHT } from './chart-priors.js';
+import { PATTERNS, TRANS } from './patterns.js';
 
 /**
  * 谱面生成器
@@ -1182,6 +1183,20 @@ export function generateChart(analysis, diff, options = {}) {
     }
   }
 
+  // 重音位（双押候选）跟着骨架重算：骨架换了，重音必须一起换，
+  // 否则双押会落在骨架外面（听起来就是"多按了一个空键"）。
+  const chordFromMask = (b, mask, st) => {
+    const slots = [];
+    for (let i = 0; i < 16; i++) if (mask[i]) slots.push(i);
+    const order = slots
+      .slice()
+      .sort((x, y) => st[y] * CHORD_SLOT_WEIGHT[y] - st[x] * CHORD_SLOT_WEIGHT[x]);
+    const k2 = Math.max(1, Math.min(6, Math.round(slots.length * (cfg.chordSlotShare ?? 0.18))));
+    const cm = new Uint8Array(16);
+    for (let c = 0; c < k2 && c < order.length; c++) cm[order[c]] = 1;
+    barChordMask.set(b, cm);
+  };
+
   // ---- 3.4 人声优先：有唱的小节跟着音节排 ----
   // 之前骨架是「4 小节对应槽位的平均击打强度」挑出来的。踩镲每半拍一下、四小节里
   // 完全一样，平均之后就是一条均匀的八分音符流 —— 音都在声音上，但每一拍分量相同，
@@ -1243,13 +1258,119 @@ export function generateChart(analysis, diff, options = {}) {
         mask[worst] = 0;
       }
       barMask.set(b, mask);
-      // 重音位跟着新骨架重算，否则双押会落在骨架外
+      chordFromMask(b, mask, st);
+    }
+  }
+
+  // ---- 3.42 节奏词汇：把"能量摊出来"的小节换成人类写过的节奏型 ----
+  // 人写谱不是每小节独立算一遍，而是在用一小批固定节奏型拼歌
+  // （Time-based Chart Partitioning, AIIDE'25 的核心观察）。
+  // 我们没唱的小节本来只能按「4 小节平均强度」挑格子 —— 踩镲每半拍一下、
+  // 四小节完全一样，平均之后就是均匀八分音符流。这里改成：从官方谱统计出的
+  // 节奏词汇里挑一个「音频支持得住、密度相当」的型，并且优先复用它上一小节
+  // 用过的那个（这就是动机的来源）。
+  if (cfg.patternSnap !== false) {
+    const chordK = 1 + 0.5 * (cfg.allowChord ? (cfg.chordSlotShare || 0) * (cfg.chordProb || 0) : 0);
+    const lib = PATTERNS[diff.id] || [];
+    const trans = TRANS[diff.id] || {};
+    let prevMask = null;
+    for (const b of barKeys) {
+      if (!lib.length) break;
+      const t0 = firstBeat + b * barDur;
+      const st = new Float32Array(16);
+      for (let i = 0; i < 16; i++) st[i] = strengthAt(t0 + (i / 16) * barDur);
+      const peak = Math.max(...st);
+      if (!(peak > 1e-6)) continue;
+      const sn = Array.from(st, (v) => v / peak);
+      // 人声小节也要过词汇表。之前人声小节"每个音节一个音"，8 个音节就是
+      // 整小节均匀八分音符 —— 人写谱不会这样，它会挑出一个可辨认的节奏格，
+      // 允许丢掉一部分音节。这里把音节当成"高吸引力格"参与打分。
+      const vs = voiceSlots.get(b);
+      const att = sn.slice();
+      let vc = 0;
+      if (vs) {
+        for (let i = 0; i < 16; i++) {
+          if (!vs[i]) continue;
+          vc++;
+          if (att[i] < 1) att[i] = 1;
+        }
+      }
+      const target = Math.max(1, Math.round((barTarget.get(b) || 4) / chordK));
+      let best = null;
+      let bestScore = -1e9;
+      for (const p of lib) {
+        if (Math.abs(p.n - target) > 1) continue;
+        let sum = 0;
+        let miss = 0;
+        let ok = true;
+        for (let i = 0; i < 16; i++) {
+          if (p.m[i] !== '1') {
+            if (vs && vs[i]) miss++;
+            continue;
+          }
+          const v = att[i];
+          // 那一格既没声音也不是音节：不能凭空按
+          if (v < 0.1 && !(vs && vs[i])) {
+            ok = false;
+            break;
+          }
+          sum += v;
+          if (v < 0.25) sum -= 0.3; // 弱音格：能读，但别指望它是重音
+        }
+        if (!ok) continue;
+        // 人写谱会丢掉弱音节，但不会丢掉三成。超过就说明这个型根本不合这段唱法。
+        if (vc >= 3 && miss > Math.max(1, Math.round(vc * 0.3))) continue;
+        // 分母用 sqrt(n)：既不让"音多"天然占优（密度失控），也不让"变稀"占优
+        // （用 n 做分母时，4 格的型永远赢 8 格的型，副歌会被削成骨架）。
+        let score = (sum - 0.45 * miss) / Math.sqrt(p.n);
+        score += 0.04 * Math.log(1 + p.w); // 人类越常用的型越优先
+        // 语序：人类谱里「这个型后面通常跟哪个型」是有习惯的（一阶马尔可夫）。
+        // 比"跟上一小节一样"更细：A→B→A 这样的句式也能被复现出来。
+        if (prevMask) {
+          // 同一型（重复）和"该跟的型"（语序）分别给分：
+          // 只给语序分的话，exact 重复反而被压掉，动机率会掉到 6%（实测）。
+          if (p.m === prevMask) score += 0.13;
+          const row = trans[prevMask];
+          if (row) {
+            let tot = 0;
+            for (const k in row) tot += row[k];
+            const cnt = row[p.m] || 0;
+            if (tot > 0 && cnt > 0) score += 0.14 * (cnt / tot);
+          }
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          best = p;
+        }
+      }
+      if (!best) continue;
+      const mask = new Uint8Array(16);
+      for (let i = 0; i < 16; i++) {
+        if (best.m[i] !== '1') continue;
+        if (sn[i] >= 0.1 || (vs && vs[i])) mask[i] = 1;
+      }
+      barMask.set(b, mask);
+      prevMask = best.m;
+      // 双押位置也由词汇表给（这一型在人类谱里哪几格常写成双押），
+      // 不按本小节音量重算 —— 否则同一个节奏型每小节的 2 都在换位置，动机就没了。
       const slots = [];
       for (let i = 0; i < 16; i++) if (mask[i]) slots.push(i);
-      const order = slots.slice().sort((x, y) => st[y] * CHORD_SLOT_WEIGHT[y] - st[x] * CHORD_SLOT_WEIGHT[x]);
-      const k2 = Math.max(1, Math.min(6, Math.round(slots.length * (cfg.chordSlotShare ?? 0.18))));
       const cm = new Uint8Array(16);
-      for (let c = 0; c < k2 && c < order.length; c++) cm[order[c]] = 1;
+      if (cfg.allowChord && slots.length) {
+        const order = slots
+          .map((i) => ({ i, c: best.c ? +best.c[i] || 0 : 0 }))
+          .sort((x, y) => y.c - x.c);
+        const k2 = Math.max(1, Math.min(6, Math.round(slots.length * (cfg.chordSlotShare ?? 0.18))));
+        let got = 0;
+        for (const o of order) {
+          if (got >= k2) break;
+          if (o.c >= 4) {
+            cm[o.i] = 1;
+            got++;
+          }
+        }
+        if (!got) cm[order[0].i] = 1;
+      }
       barChordMask.set(b, cm);
     }
   }

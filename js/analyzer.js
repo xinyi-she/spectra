@@ -460,6 +460,9 @@ export function analyzeAudio(channelData, sampleRate, onProgress = () => {}) {
     onsetStrength: os,
     rms,
     energy: { bass: energy[0], low: energy[1], mid: energy[2], high: energy[3], air: energy[4] },
+    // 频段通量（打击性起音强度）。energy 是平滑的持续能量，判强拍没用；
+    // 判"哪一拍是底鼓、哪一拍是军鼓"必须用通量。
+    flux: { bass: flux[0], low: flux[1], mid: flux[2], high: flux[3], air: flux[4] },
     onsets,
     pitch: {
       median: pitchMedian,

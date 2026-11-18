@@ -37,6 +37,8 @@ tools/_sbmaps/
 tools/_sbaudio/
 tools/_ids.json
 tools/_envelope.json
+tools/_db*.json
+tools/_s.json
 tools/_batch.json
 tools/batch_report.md
 tools/_sparebeat_priors.json
